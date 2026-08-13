@@ -1322,14 +1322,15 @@ impl UnfrozenIR {
             .iter()
             .map(|entry| {
                 cancellation.checkpoint()?;
+                let type_ann = lower_type_annotation_in(
+                    &entry.type_ann,
+                    &entry.type_resolution_owner,
+                    entry.type_src.resolve(src),
+                )?;
                 Ok(ConstEntry {
                     name: entry.name.clone(),
                     declaration_owner: entry.declaration_owner.clone(),
-                    type_ann: lower_type_annotation_in(
-                        &entry.type_ann,
-                        &entry.type_resolution_owner,
-                        entry.type_src.resolve(src),
-                    )?,
+                    type_ann,
                     expr: lower_in(
                         &entry.expr,
                         &entry.body_resolution_owner,
@@ -1347,6 +1348,11 @@ impl UnfrozenIR {
             .iter()
             .map(|entry| {
                 cancellation.checkpoint()?;
+                let type_ann = lower_type_annotation_in(
+                    &entry.type_ann,
+                    &entry.type_resolution_owner,
+                    entry.type_src.resolve(src),
+                )?;
                 let default_expr = match (&entry.default_expr, &entry.default_src) {
                     (Some(expr), Some(default_src)) => Some(lower_in(
                         expr,
@@ -1368,11 +1374,7 @@ impl UnfrozenIR {
                 Ok(ParamEntry {
                     name: entry.name.clone(),
                     declaration_owner: entry.declaration_owner.clone(),
-                    type_ann: lower_type_annotation_in(
-                        &entry.type_ann,
-                        &entry.type_resolution_owner,
-                        entry.type_src.resolve(src),
-                    )?,
+                    type_ann,
                     default_expr,
                     span: entry.span,
                     type_src: entry.type_src.clone(),
@@ -1387,14 +1389,15 @@ impl UnfrozenIR {
             .iter()
             .map(|entry| {
                 cancellation.checkpoint()?;
+                let type_ann = lower_type_annotation_in(
+                    &entry.type_ann,
+                    &entry.type_resolution_owner,
+                    entry.type_src.resolve(src),
+                )?;
                 Ok(NodeEntry {
                     name: entry.name.clone(),
                     declaration_owner: entry.declaration_owner.clone(),
-                    type_ann: lower_type_annotation_in(
-                        &entry.type_ann,
-                        &entry.type_resolution_owner,
-                        entry.type_src.resolve(src),
-                    )?,
+                    type_ann,
                     expr: lower_in(
                         &entry.expr,
                         &entry.body_resolution_owner,
@@ -2545,9 +2548,15 @@ impl ExprVisitor<crate::syntax::phase::Desugared> for NominalOverridePreflight<'
     ) -> Result<(), Self::Error> {
         for entry in entries {
             for key in &entry.keys {
-                if let crate::syntax::ast::MapEntryIndex::Named(index_name) = &key.index.value {
+                if let crate::desugar::desugared_ast::MapEntryKey::Discrete {
+                    index: key_index,
+                    entry: key_entry,
+                    ..
+                } = key
+                    && let crate::syntax::ast::MapEntryIndex::Named(index_name) = &key_index.value
+                {
                     let index = IndexName::from_atom(index_name.leaf().clone());
-                    self.check_label(&index, format!("`{}.{}`", index_name, key.variant.value))?;
+                    self.check_label(&index, format!("`{}.{}`", index_name, key_entry.value))?;
                 }
             }
             self.visit_expr(&entry.value)?;
@@ -2826,13 +2835,18 @@ impl ExprVisitorMut<crate::syntax::phase::Desugared> for IndexSubstituter<'_> {
         if let ExprKind::MapLiteral { entries } = &mut expr.kind {
             for entry in entries.iter_mut() {
                 for key in &mut entry.keys {
-                    if let crate::syntax::ast::MapEntryIndex::Named(index_name) = &key.index.value
+                    if let crate::desugar::desugared_ast::MapEntryKey::Discrete {
+                        index: key_index,
+                        ..
+                    } = key
+                        && let crate::syntax::ast::MapEntryIndex::Named(index_name) =
+                            &key_index.value
                         && let Some(new) = self
                             .bindings
                             .get(index_name.leaf().as_str())
                             .and_then(types::IndexBindingTarget::declared_name)
                     {
-                        key.index.value =
+                        key_index.value =
                             crate::syntax::ast::MapEntryIndex::Named(new.clone().into());
                     }
                 }
@@ -4214,12 +4228,16 @@ fn collect_finite_indexes_from_expr(
                 ExprKind::MapLiteral { entries } => {
                     for entry in entries {
                         for key in &entry.keys {
-                            if let crate::syntax::ast::MapEntryIndex::Finite(cardinality) =
-                                &key.index.value
+                            if let crate::desugar::desugared_ast::MapEntryKey::Discrete {
+                                index,
+                                ..
+                            } = key
+                                && let crate::syntax::ast::MapEntryIndex::Finite(cardinality) =
+                                    &index.value
                             {
                                 ensure_concrete_finite_index(
                                     *cardinality,
-                                    key.index.span,
+                                    index.span,
                                     self.registry,
                                     self.src,
                                 )?;
@@ -4780,16 +4798,6 @@ fn coordinate_invalid(
     }
 }
 
-/// One centralized binary64 endpoint comparison for coordinate construction.
-fn coordinate_values_equal(actual: f64, expected: f64, scale_hint: f64) -> bool {
-    let scale = actual.abs().max(expected.abs()).max(scale_hint.abs());
-    // Keep the tolerance relative even for coordinates near zero. A unit-scale
-    // floor would accept steps that miss tiny endpoints by a large fraction.
-    // The subnormal floor covers a small number of binary64 ULPs at zero.
-    let tolerance = (scale * (32.0 * f64::EPSILON)).max(f64::from_bits(32));
-    (actual - expected).abs() <= tolerance
-}
-
 /// Exact numeric endpoint equality after finite-value validation.
 fn coordinate_endpoints_equal(start: f64, end: f64) -> bool {
     matches!(start.partial_cmp(&end), Some(std::cmp::Ordering::Equal))
@@ -4839,7 +4847,13 @@ fn checked_range_cardinality(
     }
     let intervals = raw_intervals.round();
     let reconstructed_end = intervals.mul_add(step, start);
-    if intervals < 1.0 || !coordinate_values_equal(reconstructed_end, end, intervals * step) {
+    if intervals < 1.0
+        || !crate::registry::index::coordinate_values_equal(
+            reconstructed_end,
+            end,
+            intervals * step,
+        )
+    {
         return Err(coordinate_invalid(
             name,
             format!("step {step} does not land on endpoint {end}"),

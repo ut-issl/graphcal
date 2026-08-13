@@ -116,6 +116,34 @@ impl CoordinateIndexData {
     pub const fn cardinality(&self) -> usize {
         self.cardinality.get()
     }
+
+    /// Return the position whose generated coordinate equals `value` under
+    /// the same binary64 tolerance used to validate coordinate ranges.
+    #[must_use]
+    pub fn position_of(&self, value: f64) -> Option<usize> {
+        let scale_hint = match self.spacing {
+            CoordinateSpacing::Step { step } => step,
+            CoordinateSpacing::Linspace => self.end - self.start,
+        };
+        (0..self.cardinality()).find(|&position| {
+            coordinate_values_equal(self.coordinate_value(position), value, scale_hint)
+        })
+    }
+
+    /// Return the closest generated coordinate, for an off-grid diagnostic.
+    #[must_use]
+    pub fn nearest_coordinate(&self, value: f64) -> Option<(usize, f64)> {
+        (0..self.cardinality())
+            .map(|position| (position, self.coordinate_value(position)))
+            .min_by(|(_, lhs), (_, rhs)| (lhs - value).abs().total_cmp(&(rhs - value).abs()))
+    }
+}
+
+/// Central binary64 comparison policy for generated coordinates.
+pub(crate) fn coordinate_values_equal(actual: f64, expected: f64, scale_hint: f64) -> bool {
+    let scale = actual.abs().max(expected.abs()).max(scale_hint.abs());
+    let tolerance = (scale * (32.0 * f64::EPSILON)).max(f64::from_bits(32));
+    (actual - expected).abs() <= tolerance
 }
 
 const fn index_position_key(position: usize) -> IndexEntryKey {

@@ -730,10 +730,10 @@ fn convert_indexed(obj: &ExactJsonObject, param_name: &str) -> Result<Expr, Json
             // Overrides are lowered to HIR (which carries resolution inline),
             // so synthetic spans need no uniqueness tricks here.
             Ok(MapEntry {
-                keys: NonEmpty::singleton(MapEntryKey {
+                keys: NonEmpty::singleton(MapEntryKey::Discrete {
                     index: Spanned::new(MapEntryIndex::Named(index_path.clone()), SYNTH_SPAN),
                     additional_index_spans: Vec::new(),
-                    variant: Spanned::new(
+                    entry: Spanned::new(
                         IndexEntryKey::named(IndexVariantName::try_new(variant.clone()).map_err(
                             |reason| JsonInputError::InvalidName {
                                 param: format!("{param_name}[{variant}]"),
@@ -909,7 +909,10 @@ mod tests {
         match &expr.kind {
             ExprKind::MapLiteral { entries } => {
                 assert_eq!(entries.len(), 3);
-                assert_eq!(entries[0].keys[0].index.value.to_string(), "Maneuver");
+                let MapEntryKey::Discrete { index, .. } = &entries[0].keys[0] else {
+                    panic!("expected a discrete map key")
+                };
+                assert_eq!(index.value.to_string(), "Maneuver");
             }
             other => panic!("expected MapLiteral, got {other:?}"),
         }
@@ -971,7 +974,10 @@ mod tests {
 
         match &overrides[&DeclName::expect_valid("series")].kind {
             ExprKind::MapLiteral { entries } => {
-                assert_eq!(entries[0].keys[0].index.value.to_string(), "lib.Phase");
+                let MapEntryKey::Discrete { index, .. } = &entries[0].keys[0] else {
+                    panic!("expected a discrete map key")
+                };
+                assert_eq!(index.value.to_string(), "lib.Phase");
             }
             other => panic!("expected MapLiteral, got {other:?}"),
         }

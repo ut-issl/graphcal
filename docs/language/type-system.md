@@ -996,6 +996,12 @@ param delta_v_budget: Velocity[Phase, Maneuver] = {
 
 Single-axis map literals use bare keys (`Maneuver.Departure: ...`); multi-axis map literals use tuple keys (`(Phase.Launch, Maneuver.Departure): ...`).
 
+For a concrete coordinate index, a key may instead be a statically evaluable
+quantity on that index's grid, such as `300.0 km`. Its dimension must match the
+coordinate index, and every generated grid point must still be covered exactly
+once. Tuple map keys and table labels may mix these quantity keys with named
+labels.
+
 Map (and `table`) literal entry order is not significant: the constructed
 value is normalized to the index order, so a literal that lists
 `Maneuver.Insertion` first is identical to one written in declaration order.

@@ -463,18 +463,21 @@ fn check_decl_expr_type(
         body_ctx.src,
         DiagnosticAnchor::Source(*type_ann_span),
     )?;
-    let inferred = infer::hir::infer_hir_type_with_materialized_shapes_and_cancellation(
-        hir_expr,
-        Some(&owner),
-        body_ctx.declared_types,
-        dag,
-        body_ctx.tir,
-        body_ctx.registry,
-        body_ctx.builtin_fns,
-        body_ctx.src,
-        body_ctx.cancellation,
-        body_ctx.materialized_shapes.clone(),
-    )?;
+    let expected = InferredType::from(declared);
+    let inferred =
+        infer::hir::infer_hir_type_with_expected_and_materialized_shapes_and_cancellation(
+            hir_expr,
+            &expected,
+            Some(&owner),
+            body_ctx.declared_types,
+            dag,
+            body_ctx.tir,
+            body_ctx.registry,
+            body_ctx.builtin_fns,
+            body_ctx.src,
+            body_ctx.cancellation,
+            body_ctx.materialized_shapes.clone(),
+        )?;
     let matches = body_ctx
         .dag
         .and_then(|dag| dag.resolved_decl_types.get(name))
@@ -1019,11 +1022,16 @@ pub fn check_dimensions_tir_with_cancellation(
                 cancellation,
                 &collector,
             )?;
-            Ok((dag_id.clone(), collector.snapshot(), plot_shapes))
+            Ok((
+                dag_id.clone(),
+                collector.snapshot(),
+                collector.map_literal_axes_snapshot(),
+                plot_shapes,
+            ))
         })
         .collect::<Result<Vec<_>, GraphcalError>>()?;
     let mut checked_plot_shapes = HashMap::new();
-    for (dag_id, shapes, plot_shapes) in checked_dag_facts {
+    for (dag_id, shapes, map_literal_axes, plot_shapes) in checked_dag_facts {
         let dag = tir.dags.get_mut(&dag_id).ok_or_else(|| {
             GraphcalError::internal_error(
                 format!("checked DAG `{dag_id}` disappeared while installing shape facts"),
@@ -1032,6 +1040,7 @@ pub fn check_dimensions_tir_with_cancellation(
             )
         })?;
         dag.semantic.materialized_shapes = shapes;
+        dag.semantic.map_literal_axes = map_literal_axes;
         checked_plot_shapes.insert(dag_id, plot_shapes);
     }
 
@@ -1173,9 +1182,18 @@ pub fn collect_override_dependency_summary_with_cancellation(
                 body_src,
                 DiagnosticAnchor::Source(param.span),
             )?;
+            let expected = declared_types
+                .get(&param.name)
+                .map(InferredType::from)
+                .ok_or_else(|| GraphcalError::InternalError {
+                    message: format!("no declared type recorded for parameter `{}`", param.name),
+                    src: body_src.clone(),
+                    span: param.span.into(),
+                })?;
             let (_, mut dependencies) =
                 infer::hir::infer_hir_type_with_nominal_dependencies_and_cancellation(
                     default_expr,
+                    &expected,
                     &owner,
                     &declared_types,
                     dag,

@@ -224,6 +224,7 @@ fn eval_hir_expr_inner(
         hir::ExprKind::MapLiteral { entries } => eval_hir_map_literal(
             expr.span,
             entries,
+            0,
             values,
             presentation_values,
             local_values,
@@ -1789,6 +1790,7 @@ fn ensure_index_ref_matches_resolved(
 
 fn map_entry_index_ref(
     key: &hir::expr::MapEntryKey,
+    checked_axis: &IndexTypeRef,
     ctx: &EvalContext<'_>,
 ) -> Result<IndexTypeRef, GraphcalError> {
     match key {
@@ -1800,12 +1802,53 @@ fn map_entry_index_ref(
                 .map_err(|err| ctx.eval_error(err.to_string(), position.span))?;
             Ok(IndexTypeRef::from_finite_index(finite_index))
         }
+        hir::expr::MapEntryKey::Expression { axis, expr } => {
+            if let hir::expr::MapKeyAxis::Explicit(index) = axis {
+                ensure_index_ref_matches_resolved(checked_axis, &index.value, index.span, ctx)?;
+            }
+            if checked_axis.declared_resolved().is_none() {
+                return Err(ctx.internal_error(
+                    "checked expression-shaped map key has a finite axis",
+                    expr.span,
+                ));
+            }
+            Ok(checked_axis.clone())
+        }
+    }
+}
+
+fn explicit_map_entry_index_ref(
+    key: &hir::expr::MapEntryKey,
+    ctx: &EvalContext<'_>,
+) -> Result<IndexTypeRef, GraphcalError> {
+    match key {
+        hir::expr::MapEntryKey::IndexVariant(variant) => {
+            Ok(IndexTypeRef::from_resolved(variant.variant.index().clone()))
+        }
+        hir::expr::MapEntryKey::FinitePosition { size, position } => {
+            let finite_index = graphcal_compiler::registry::types::FiniteIndex::try_from_u64(*size)
+                .map_err(|err| ctx.eval_error(err.to_string(), position.span))?;
+            Ok(IndexTypeRef::from_finite_index(finite_index))
+        }
+        hir::expr::MapEntryKey::Expression {
+            axis: hir::expr::MapKeyAxis::Explicit(index),
+            ..
+        } => Ok(IndexTypeRef::from_resolved(index.value.clone())),
+        hir::expr::MapEntryKey::Expression {
+            axis: hir::expr::MapKeyAxis::Contextual,
+            expr,
+        } => Err(ctx.internal_error(
+            "contextual map key reached evaluation without checked axis facts",
+            expr.span,
+        )),
     }
 }
 
 fn map_entry_variant_for_axis(
     key: &hir::expr::MapEntryKey,
     axis: &IndexTypeRef,
+    values: &RuntimeValueMap,
+    local_values: &HirLocalValueMap<'_>,
     ctx: &EvalContext<'_>,
 ) -> Result<IndexEntryKey, GraphcalError> {
     match key {
@@ -1821,26 +1864,52 @@ fn map_entry_variant_for_axis(
         hir::expr::MapEntryKey::FinitePosition { position, .. } => {
             Ok(IndexEntryKey::position(position.value))
         }
+        hir::expr::MapEntryKey::Expression {
+            axis: key_axis,
+            expr,
+        } => {
+            if let hir::expr::MapKeyAxis::Explicit(index) = key_axis {
+                ensure_index_ref_matches_resolved(axis, &index.value, index.span, ctx)?;
+            }
+            let value = eval_hir_expr(expr, values, local_values, ctx)?;
+            let RuntimeValue::Quantity(value) = value else {
+                return Err(
+                    ctx.internal_error("checked coordinate key is not a quantity", expr.span)
+                );
+            };
+            let index = axis.declared_resolved().ok_or_else(|| {
+                ctx.internal_error("checked coordinate key has a finite axis", expr.span)
+            })?;
+            let definition = ctx
+                .tir
+                .declared_index_def(index)
+                .ok_or_else(|| ctx.internal_error(format!("unknown index `{index}`"), expr.span))?;
+            let data = definition.coordinate_data().ok_or_else(|| {
+                ctx.internal_error(format!("index `{index}` is not coordinate"), expr.span)
+            })?;
+            let position = data.position_of(value).ok_or_else(|| {
+                ctx.internal_error(
+                    format!("checked coordinate key {value} is not on `{index}`"),
+                    expr.span,
+                )
+            })?;
+            Ok(IndexEntryKey::position(position as u64))
+        }
     }
 }
 
 fn map_entry_index_def<'a>(
-    key: &hir::expr::MapEntryKey,
     index_ref: &IndexTypeRef,
     ctx: &'a EvalContext<'_>,
 ) -> Option<&'a IndexDef> {
-    match key {
-        hir::expr::MapEntryKey::IndexVariant(variant) => {
-            ctx.tir.declared_index_def(variant.variant.index())
-        }
-        hir::expr::MapEntryKey::FinitePosition { .. } => index_def_for_ref(index_ref, ctx),
-    }
+    index_def_for_ref(index_ref, ctx)
 }
 
 fn map_entry_key_span(key: &hir::expr::MapEntryKey) -> Span {
     match key {
         hir::expr::MapEntryKey::IndexVariant(variant) => variant.path_span(),
         hir::expr::MapEntryKey::FinitePosition { position, .. } => position.span,
+        hir::expr::MapEntryKey::Expression { expr, .. } => expr.span,
     }
 }
 
@@ -1851,6 +1920,7 @@ fn map_entry_key_span(key: &hir::expr::MapEntryKey) -> Span {
 fn eval_hir_map_literal(
     map_span: Span,
     entries: &[hir::expr::MapEntry],
+    axis_offset: usize,
     values: &RuntimeValueMap,
     presentation_values: Option<&PresentationInstanceMap>,
     local_values: &HirLocalValueMap<'_>,
@@ -1861,10 +1931,19 @@ fn eval_hir_map_literal(
         .ok_or_else(|| ctx.internal_error("empty map literal", map_span))?;
     let first_key = first.keys.first();
     let arity = first.keys.len();
-    let idx_name = map_entry_index_ref(first_key, ctx)?;
+    let checked_axis = ctx
+        .current_decl
+        .as_ref()
+        .and_then(|owner| ctx.current_dag.map_literal_axes(owner, map_span))
+        .and_then(|axes| axes.as_slice().get(axis_offset));
+    let idx_name = if let Some(checked_axis) = checked_axis {
+        map_entry_index_ref(first_key, checked_axis, ctx)?
+    } else {
+        explicit_map_entry_index_ref(first_key, ctx)?
+    };
 
     if arity == 1 {
-        let idx_def = map_entry_index_def(first_key, &idx_name, ctx).ok_or_else(|| {
+        let idx_def = map_entry_index_def(&idx_name, ctx).ok_or_else(|| {
             ctx.internal_error(
                 format!("unknown index `{idx_name}`"),
                 map_entry_key_span(first_key),
@@ -1873,7 +1952,7 @@ fn eval_hir_map_literal(
         let mut evaluated = IndexMap::new();
         for entry in entries {
             let key = entry.keys.first();
-            let variant = map_entry_variant_for_axis(key, &idx_name, ctx)?;
+            let variant = map_entry_variant_for_axis(key, &idx_name, values, local_values, ctx)?;
             let value = eval_hir_expr_evaluated(
                 &entry.value,
                 values,
@@ -1909,7 +1988,7 @@ fn eval_hir_map_literal(
         ));
     }
 
-    let idx_def = map_entry_index_def(first_key, &idx_name, ctx).ok_or_else(|| {
+    let idx_def = map_entry_index_def(&idx_name, ctx).ok_or_else(|| {
         ctx.internal_error(
             format!("unknown index `{idx_name}`"),
             map_entry_key_span(first_key),
@@ -1922,7 +2001,9 @@ fn eval_hir_map_literal(
         let mut sub_entries = Vec::new();
         for entry in entries {
             let first_entry_key = entry.keys.first();
-            if map_entry_variant_for_axis(first_entry_key, &idx_name, ctx)? != *variant {
+            if map_entry_variant_for_axis(first_entry_key, &idx_name, values, local_values, ctx)?
+                != *variant
+            {
                 continue;
             }
             let keys = graphcal_compiler::syntax::non_empty::NonEmpty::try_from_vec(
@@ -1950,6 +2031,9 @@ fn eval_hir_map_literal(
         let evaluated = eval_hir_map_literal(
             map_span,
             &sub_entries,
+            axis_offset
+                .checked_add(1)
+                .ok_or_else(|| ctx.internal_error("map literal axis offset overflow", map_span))?,
             values,
             presentation_values,
             local_values,

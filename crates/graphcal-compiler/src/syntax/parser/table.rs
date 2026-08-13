@@ -1,4 +1,6 @@
-use crate::syntax::ast::{Expr, ExprKind, MapEntry, MapEntryIndex, MapEntryKey, TableIndexSpec};
+use crate::syntax::ast::{
+    Expr, ExprKind, MapEntry, MapEntryIndex, MapEntryKey, MapKeyAxisSyntax, TableIndexSpec,
+};
 use crate::syntax::index_name::{IndexEntryKey, IndexVariantName};
 use crate::syntax::names::NamePath;
 use crate::syntax::non_empty::NonEmpty;
@@ -9,17 +11,23 @@ use crate::syntax::token::{ContextualKeyword, Token};
 use super::{ParseError, Parser};
 
 enum TableColumnKeys {
-    Named(Vec<Spanned<IndexEntryKey>>),
+    Explicit(Vec<MapEntryKey>),
     Finite { cardinality: u64, span: Span },
 }
 
 impl TableColumnKeys {
-    fn key_at(&self, position: usize) -> Option<Spanned<IndexEntryKey>> {
+    fn key_at(&self, position: usize, index: &Spanned<MapEntryIndex>) -> Option<MapEntryKey> {
         match self {
-            Self::Named(keys) => keys.get(position).cloned(),
-            Self::Finite { span, .. } => u64::try_from(position)
-                .ok()
-                .map(|position| Spanned::new(IndexEntryKey::position(position), *span)),
+            Self::Explicit(keys) => keys.get(position).cloned(),
+            Self::Finite { span, .. } => {
+                u64::try_from(position)
+                    .ok()
+                    .map(|position| MapEntryKey::Discrete {
+                        index: index.clone(),
+                        additional_index_spans: Vec::new(),
+                        entry: Spanned::new(IndexEntryKey::position(position), *span),
+                    })
+            }
         }
     }
 }
@@ -162,7 +170,7 @@ impl Parser<'_> {
 
     fn table_column_count(&self, columns: &TableColumnKeys, span: Span) -> Result<u64, ParseError> {
         match columns {
-            TableColumnKeys::Named(keys) => self.table_count_from_len(keys.len(), span),
+            TableColumnKeys::Explicit(keys) => self.table_count_from_len(keys.len(), span),
             TableColumnKeys::Finite { cardinality, .. } => Ok(*cardinality),
         }
     }
@@ -186,18 +194,26 @@ impl Parser<'_> {
     ) -> Result<Vec<MapEntry>, ParseError> {
         let mut entries = Vec::new();
         while self.lexer.peek() != Some(&Token::RBrace) {
-            let label = self.parse_any_ident()?;
+            let key = if self.lexer.peek().is_some_and(|token| token.is_identifier())
+                && self.lexer.peek_second() == Some(&Token::Colon)
+            {
+                let label = self.parse_any_ident()?;
+                MapEntryKey::Discrete {
+                    index: Self::named_index_spanned(index),
+                    additional_index_spans: Vec::new(),
+                    entry: Self::named_entry_key_spanned(label.into_spanned::<IndexVariantName>()),
+                }
+            } else {
+                MapEntryKey::Expression {
+                    axis: MapKeyAxisSyntax::Explicit(index.clone()),
+                    expr: self.parse_expr()?,
+                }
+            };
             self.expect(Token::Colon)?;
             let value = self.parse_expr()?;
             self.expect(Token::Semicolon)?;
             entries.push(MapEntry {
-                keys: NonEmpty::singleton(MapEntryKey {
-                    index: Self::named_index_spanned(index),
-                    additional_index_spans: Vec::new(),
-                    variant: Self::named_entry_key_spanned(
-                        label.into_spanned::<IndexVariantName>(),
-                    ),
-                }),
+                keys: NonEmpty::singleton(key),
                 value,
             });
         }
@@ -213,10 +229,10 @@ impl Parser<'_> {
             self.expect(Token::Semicolon)?;
             let i = self.table_count_from_len(entries.len(), value.span)?;
             entries.push(MapEntry {
-                keys: NonEmpty::singleton(MapEntryKey {
+                keys: NonEmpty::singleton(MapEntryKey::Discrete {
                     index: index.clone(),
                     additional_index_spans: Vec::new(),
-                    variant: Self::finite_position_spanned(i, value.span),
+                    entry: Self::finite_position_spanned(i, value.span),
                 }),
                 value,
             });
@@ -271,14 +287,30 @@ impl Parser<'_> {
         // - Named column axis: requires `: ColLabel1, ColLabel2, ...;`
         // - Finite column axis: no header; auto-generate `#0..#(n-1)` labels.
         let col_labels = match col_spec {
-            TableIndexSpec::Named(_) => {
+            TableIndexSpec::Named(axis) => {
                 self.expect(Token::Colon)?;
                 let mut labels = Vec::new();
                 loop {
-                    let label = self.parse_any_ident()?;
-                    labels.push(Self::named_entry_key_spanned(
-                        label.into_spanned::<IndexVariantName>(),
-                    ));
+                    if self.lexer.peek().is_some_and(|token| token.is_identifier())
+                        && matches!(
+                            self.lexer.peek_second(),
+                            Some(Token::Comma | Token::Semicolon)
+                        )
+                    {
+                        let label = self.parse_any_ident()?;
+                        labels.push(MapEntryKey::Discrete {
+                            index: col_index_template.clone(),
+                            additional_index_spans: Vec::new(),
+                            entry: Self::named_entry_key_spanned(
+                                label.into_spanned::<IndexVariantName>(),
+                            ),
+                        });
+                    } else {
+                        labels.push(MapEntryKey::Expression {
+                            axis: MapKeyAxisSyntax::Explicit(axis.clone()),
+                            expr: self.parse_expr()?,
+                        });
+                    }
                     if self.lexer.peek() == Some(&Token::Comma) {
                         self.lexer.next_token();
                     } else {
@@ -286,7 +318,7 @@ impl Parser<'_> {
                     }
                 }
                 self.expect(Token::Semicolon)?;
-                TableColumnKeys::Named(labels)
+                TableColumnKeys::Explicit(labels)
             }
             TableIndexSpec::Finite { cardinality, span } => TableColumnKeys::Finite {
                 cardinality: *cardinality,
@@ -302,12 +334,34 @@ impl Parser<'_> {
         {
             // Determine the row label for this row.
             let (row_label, row_label_span) = match row_spec {
-                TableIndexSpec::Named(_) => {
-                    let row_label_ident = self.parse_any_ident()?;
-                    let span = row_label_ident.span;
-                    let label = Self::named_entry_key_spanned(
-                        row_label_ident.into_spanned::<IndexVariantName>(),
-                    );
+                TableIndexSpec::Named(axis) => {
+                    let (label, span) =
+                        if self.lexer.peek().is_some_and(|token| token.is_identifier())
+                            && self.lexer.peek_second() == Some(&Token::Colon)
+                        {
+                            let row_label_ident = self.parse_any_ident()?;
+                            let span = row_label_ident.span;
+                            (
+                                MapEntryKey::Discrete {
+                                    index: row_index_template.clone(),
+                                    additional_index_spans: Vec::new(),
+                                    entry: Self::named_entry_key_spanned(
+                                        row_label_ident.into_spanned::<IndexVariantName>(),
+                                    ),
+                                },
+                                span,
+                            )
+                        } else {
+                            let quantity = self.parse_expr()?;
+                            let span = quantity.span;
+                            (
+                                MapEntryKey::Expression {
+                                    axis: MapKeyAxisSyntax::Explicit(axis.clone()),
+                                    expr: quantity,
+                                },
+                                span,
+                            )
+                        };
                     self.expect(Token::Colon)?;
                     (label, span)
                 }
@@ -316,7 +370,14 @@ impl Parser<'_> {
                     // row-length mismatch logic below; the row is still parsed.
                     let label = Self::finite_position_spanned(row_index_counter, *span);
                     let span = self.lexer.peek_with_span().map_or(*span, |(_, s)| s);
-                    (label, span)
+                    (
+                        MapEntryKey::Discrete {
+                            index: row_index_template.clone(),
+                            additional_index_spans: Vec::new(),
+                            entry: label,
+                        },
+                        span,
+                    )
                 }
             };
 
@@ -350,22 +411,15 @@ impl Parser<'_> {
             }
 
             for (col_idx, value) in row_values.into_iter().enumerate() {
-                let row_key = MapEntryKey {
-                    index: row_index_template.clone(),
-                    additional_index_spans: Vec::new(),
-                    variant: row_label.clone(),
-                };
-                let column_key = MapEntryKey {
-                    index: col_index_template.clone(),
-                    additional_index_spans: Vec::new(),
-                    variant: col_labels.key_at(col_idx).ok_or_else(|| {
-                        ParseError::InvalidNumber {
+                let row_key = row_label.clone();
+                let column_key =
+                    col_labels
+                        .key_at(col_idx, &col_index_template)
+                        .ok_or_else(|| ParseError::InvalidNumber {
                             reason: "table column position does not fit in u64".to_string(),
                             src: self.named_source(),
                             span: value.span.into(),
-                        }
-                    })?,
-                };
+                        })?;
                 entries.push(MapEntry {
                     keys: table_entry_keys(prefix_keys.to_vec(), row_key, column_key),
                     value,
@@ -411,19 +465,28 @@ impl Parser<'_> {
                 }
                 match slice_index {
                     TableIndexSpec::Named(axis) => {
-                        let (index, variant, _) = self.parse_index_variant_path()?;
-                        if index.value != axis.value {
-                            return Err(self.unexpected_token(
-                                &format!("slice axis `{}`", axis.value.display_path()),
-                                &index.value.display_path(),
-                                index.span,
-                            ));
+                        if self.lexer.peek().is_some_and(|token| token.is_identifier())
+                            && self.lexer.peek_second() == Some(&Token::Dot)
+                        {
+                            let (index, variant, _) = self.parse_index_variant_path()?;
+                            if index.value != axis.value {
+                                return Err(self.unexpected_token(
+                                    &format!("slice axis `{}`", axis.value.display_path()),
+                                    &index.value.display_path(),
+                                    index.span,
+                                ));
+                            }
+                            prefix_keys.push(MapEntryKey::Discrete {
+                                index: Spanned::new(MapEntryIndex::Named(index.value), index.span),
+                                additional_index_spans: vec![axis.span],
+                                entry: Self::named_entry_key_spanned(variant),
+                            });
+                        } else {
+                            prefix_keys.push(MapEntryKey::Expression {
+                                axis: MapKeyAxisSyntax::Explicit(axis.clone()),
+                                expr: self.parse_expr()?,
+                            });
                         }
-                        prefix_keys.push(MapEntryKey {
-                            index: Spanned::new(MapEntryIndex::Named(index.value), index.span),
-                            additional_index_spans: vec![axis.span],
-                            variant: Self::named_entry_key_spanned(variant),
-                        });
                     }
                     TableIndexSpec::Finite { cardinality, span } => {
                         let (_, hash_span) = self.expect(Token::Hash)?;
@@ -444,10 +507,10 @@ impl Parser<'_> {
                             });
                         }
                         let variant_span = hash_span.merge(num_span);
-                        prefix_keys.push(MapEntryKey {
+                        prefix_keys.push(MapEntryKey::Discrete {
                             index: Self::finite_index_index_spanned(*cardinality, *span),
                             additional_index_spans: Vec::new(),
-                            variant: Self::finite_position_spanned(value, variant_span),
+                            entry: Self::finite_position_spanned(value, variant_span),
                         });
                     }
                 }
@@ -476,10 +539,10 @@ impl Parser<'_> {
         self.expect(Token::Colon)?;
         let value = self.parse_expr()?;
         let mut entries = vec![MapEntry {
-            keys: NonEmpty::singleton(MapEntryKey {
+            keys: NonEmpty::singleton(MapEntryKey::Discrete {
                 index: Self::named_index_spanned_owned(first_index),
                 additional_index_spans: Vec::new(),
-                variant: Self::named_entry_key_spanned(first_variant),
+                entry: Self::named_entry_key_spanned(first_variant),
             }),
             value,
         }];
@@ -493,10 +556,10 @@ impl Parser<'_> {
             self.expect(Token::Colon)?;
             let value = self.parse_expr()?;
             entries.push(MapEntry {
-                keys: NonEmpty::singleton(MapEntryKey {
+                keys: NonEmpty::singleton(MapEntryKey::Discrete {
                     index: Self::named_index_spanned_owned(index),
                     additional_index_spans: Vec::new(),
-                    variant: Self::named_entry_key_spanned(variant),
+                    entry: Self::named_entry_key_spanned(variant),
                 }),
                 value,
             });
@@ -504,6 +567,44 @@ impl Parser<'_> {
         let (_, end_span) = self.expect(Token::RBrace)?;
         let span = brace_span.merge(end_span);
         Ok(Expr::new(ExprKind::MapLiteral { entries }, span))
+    }
+
+    /// Parse a quantity-keyed map literal after the first key expression.
+    pub(super) fn parse_coordinate_map_literal_after_first_entry(
+        &mut self,
+        brace_span: Span,
+        first_quantity: Expr,
+    ) -> Result<Expr, ParseError> {
+        self.expect(Token::Colon)?;
+        let value = self.parse_expr()?;
+        let mut entries = vec![MapEntry {
+            keys: NonEmpty::singleton(MapEntryKey::Expression {
+                axis: MapKeyAxisSyntax::Contextual,
+                expr: first_quantity,
+            }),
+            value,
+        }];
+        while self.lexer.peek() == Some(&Token::Comma) {
+            self.lexer.next_token();
+            if self.lexer.peek() == Some(&Token::RBrace) {
+                break;
+            }
+            let quantity = self.parse_expr()?;
+            self.expect(Token::Colon)?;
+            let value = self.parse_expr()?;
+            entries.push(MapEntry {
+                keys: NonEmpty::singleton(MapEntryKey::Expression {
+                    axis: MapKeyAxisSyntax::Contextual,
+                    expr: quantity,
+                }),
+                value,
+            });
+        }
+        let (_, end_span) = self.expect(Token::RBrace)?;
+        Ok(Expr::new(
+            ExprKind::MapLiteral { entries },
+            brace_span.merge(end_span),
+        ))
     }
 
     /// Parse a tuple-key map literal after `{` has been consumed.
@@ -519,21 +620,11 @@ impl Parser<'_> {
                 break;
             }
             self.expect(Token::LParen)?;
-            let (index, variant, _) = self.parse_index_variant_path()?;
-            let first_key = MapEntryKey {
-                index: Self::named_index_spanned_owned(index),
-                additional_index_spans: Vec::new(),
-                variant: Self::named_entry_key_spanned(variant),
-            };
+            let first_key = self.parse_tuple_map_key()?;
             let mut rest_keys = Vec::new();
             while self.lexer.peek() == Some(&Token::Comma) {
                 self.lexer.next_token();
-                let (index, variant, _) = self.parse_index_variant_path()?;
-                rest_keys.push(MapEntryKey {
-                    index: Self::named_index_spanned_owned(index),
-                    additional_index_spans: Vec::new(),
-                    variant: Self::named_entry_key_spanned(variant),
-                });
+                rest_keys.push(self.parse_tuple_map_key()?);
             }
             self.expect(Token::RParen)?;
             self.expect(Token::Colon)?;
@@ -552,6 +643,24 @@ impl Parser<'_> {
         let span = brace_span.merge(end_span);
         Ok(Expr::new(ExprKind::MapLiteral { entries }, span))
     }
+
+    fn parse_tuple_map_key(&mut self) -> Result<MapEntryKey, ParseError> {
+        if self.lexer.peek().is_some_and(|token| token.is_identifier())
+            && self.lexer.peek_second() == Some(&Token::Dot)
+        {
+            let (index, variant, _) = self.parse_index_variant_path()?;
+            Ok(MapEntryKey::Discrete {
+                index: Self::named_index_spanned_owned(index),
+                additional_index_spans: Vec::new(),
+                entry: Self::named_entry_key_spanned(variant),
+            })
+        } else {
+            Ok(MapEntryKey::Expression {
+                axis: MapKeyAxisSyntax::Contextual,
+                expr: self.parse_expr()?,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -567,10 +676,22 @@ mod tests {
             DeclKind::Param(p) => match &p.value.as_ref().unwrap().kind {
                 ExprKind::MapLiteral { entries } => {
                     assert_eq!(entries.len(), 2);
-                    assert_eq!(entries[0].keys[0].index.value.to_string(), "Maneuver");
-                    assert_eq!(entries[0].keys[0].variant.value.to_string(), "Departure");
-                    assert_eq!(entries[1].keys[0].index.value.to_string(), "Maneuver");
-                    assert_eq!(entries[1].keys[0].variant.value.to_string(), "Correction");
+                    assert_eq!(
+                        entries[0].keys[0].discrete_index().value.to_string(),
+                        "Maneuver"
+                    );
+                    assert_eq!(
+                        entries[0].keys[0].discrete_entry().value.to_string(),
+                        "Departure"
+                    );
+                    assert_eq!(
+                        entries[1].keys[0].discrete_index().value.to_string(),
+                        "Maneuver"
+                    );
+                    assert_eq!(
+                        entries[1].keys[0].discrete_entry().value.to_string(),
+                        "Correction"
+                    );
                 }
                 other => panic!("expected MapLiteral, got {other:?}"),
             },
@@ -610,10 +731,22 @@ mod tests {
                     assert_eq!(named_index_name(&indexes[0]), "Maneuver");
                     assert_eq!(entries.len(), 3);
                     assert_eq!(entries[0].keys.len(), 1);
-                    assert_eq!(entries[0].keys[0].index.value.to_string(), "Maneuver");
-                    assert_eq!(entries[0].keys[0].variant.value.to_string(), "Departure");
-                    assert_eq!(entries[1].keys[0].variant.value.to_string(), "Correction");
-                    assert_eq!(entries[2].keys[0].variant.value.to_string(), "Insertion");
+                    assert_eq!(
+                        entries[0].keys[0].discrete_index().value.to_string(),
+                        "Maneuver"
+                    );
+                    assert_eq!(
+                        entries[0].keys[0].discrete_entry().value.to_string(),
+                        "Departure"
+                    );
+                    assert_eq!(
+                        entries[1].keys[0].discrete_entry().value.to_string(),
+                        "Correction"
+                    );
+                    assert_eq!(
+                        entries[2].keys[0].discrete_entry().value.to_string(),
+                        "Insertion"
+                    );
                 }
                 other => panic!("expected TableLiteral, got {other:?}"),
             },
@@ -638,10 +771,13 @@ mod tests {
                     assert_eq!(indexes.len(), 1);
                     assert_eq!(finite_index_size(&indexes[0]), 3);
                     assert_eq!(entries.len(), 3);
-                    assert_eq!(entries[0].keys[0].index.value.to_string(), "Fin(3)");
-                    assert_eq!(entries[0].keys[0].variant.value.to_string(), "#0");
-                    assert_eq!(entries[1].keys[0].variant.value.to_string(), "#1");
-                    assert_eq!(entries[2].keys[0].variant.value.to_string(), "#2");
+                    assert_eq!(
+                        entries[0].keys[0].discrete_index().value.to_string(),
+                        "Fin(3)"
+                    );
+                    assert_eq!(entries[0].keys[0].discrete_entry().value.to_string(), "#0");
+                    assert_eq!(entries[1].keys[0].discrete_entry().value.to_string(), "#1");
+                    assert_eq!(entries[2].keys[0].discrete_entry().value.to_string(), "#2");
                 }
                 other => panic!("expected TableLiteral, got {other:?}"),
             },
@@ -682,13 +818,34 @@ mod tests {
                     assert_eq!(named_index_name(&indexes[1]), "Maneuver");
                     assert_eq!(entries.len(), 9);
                     assert_eq!(entries[0].keys.len(), 2);
-                    assert_eq!(entries[0].keys[0].index.value.to_string(), "Phase");
-                    assert_eq!(entries[0].keys[0].variant.value.to_string(), "Launch");
-                    assert_eq!(entries[0].keys[1].index.value.to_string(), "Maneuver");
-                    assert_eq!(entries[0].keys[1].variant.value.to_string(), "Departure");
-                    assert_eq!(entries[1].keys[1].variant.value.to_string(), "Correction");
-                    assert_eq!(entries[8].keys[0].variant.value.to_string(), "Arrival");
-                    assert_eq!(entries[8].keys[1].variant.value.to_string(), "Insertion");
+                    assert_eq!(
+                        entries[0].keys[0].discrete_index().value.to_string(),
+                        "Phase"
+                    );
+                    assert_eq!(
+                        entries[0].keys[0].discrete_entry().value.to_string(),
+                        "Launch"
+                    );
+                    assert_eq!(
+                        entries[0].keys[1].discrete_index().value.to_string(),
+                        "Maneuver"
+                    );
+                    assert_eq!(
+                        entries[0].keys[1].discrete_entry().value.to_string(),
+                        "Departure"
+                    );
+                    assert_eq!(
+                        entries[1].keys[1].discrete_entry().value.to_string(),
+                        "Correction"
+                    );
+                    assert_eq!(
+                        entries[8].keys[0].discrete_entry().value.to_string(),
+                        "Arrival"
+                    );
+                    assert_eq!(
+                        entries[8].keys[1].discrete_entry().value.to_string(),
+                        "Insertion"
+                    );
                 }
                 other => panic!("expected TableLiteral, got {other:?}"),
             },
@@ -738,12 +895,18 @@ mod tests {
                     assert_eq!(finite_index_size(&indexes[0]), 2);
                     assert_eq!(finite_index_size(&indexes[1]), 3);
                     assert_eq!(entries.len(), 6);
-                    assert_eq!(entries[0].keys[0].index.value.to_string(), "Fin(2)");
-                    assert_eq!(entries[0].keys[0].variant.value.to_string(), "#0");
-                    assert_eq!(entries[0].keys[1].index.value.to_string(), "Fin(3)");
-                    assert_eq!(entries[0].keys[1].variant.value.to_string(), "#0");
-                    assert_eq!(entries[5].keys[0].variant.value.to_string(), "#1");
-                    assert_eq!(entries[5].keys[1].variant.value.to_string(), "#2");
+                    assert_eq!(
+                        entries[0].keys[0].discrete_index().value.to_string(),
+                        "Fin(2)"
+                    );
+                    assert_eq!(entries[0].keys[0].discrete_entry().value.to_string(), "#0");
+                    assert_eq!(
+                        entries[0].keys[1].discrete_index().value.to_string(),
+                        "Fin(3)"
+                    );
+                    assert_eq!(entries[0].keys[1].discrete_entry().value.to_string(), "#0");
+                    assert_eq!(entries[5].keys[0].discrete_entry().value.to_string(), "#1");
+                    assert_eq!(entries[5].keys[1].discrete_entry().value.to_string(), "#2");
                 }
                 other => panic!("expected TableLiteral, got {other:?}"),
             },
@@ -768,11 +931,20 @@ mod tests {
                     assert_eq!(named_index_name(&indexes[0]), "Phase");
                     assert_eq!(finite_index_size(&indexes[1]), 3);
                     assert_eq!(entries.len(), 6);
-                    assert_eq!(entries[0].keys[0].index.value.to_string(), "Phase");
-                    assert_eq!(entries[0].keys[0].variant.value.to_string(), "Launch");
-                    assert_eq!(entries[0].keys[1].index.value.to_string(), "Fin(3)");
-                    assert_eq!(entries[0].keys[1].variant.value.to_string(), "#0");
-                    assert_eq!(entries[2].keys[1].variant.value.to_string(), "#2");
+                    assert_eq!(
+                        entries[0].keys[0].discrete_index().value.to_string(),
+                        "Phase"
+                    );
+                    assert_eq!(
+                        entries[0].keys[0].discrete_entry().value.to_string(),
+                        "Launch"
+                    );
+                    assert_eq!(
+                        entries[0].keys[1].discrete_index().value.to_string(),
+                        "Fin(3)"
+                    );
+                    assert_eq!(entries[0].keys[1].discrete_entry().value.to_string(), "#0");
+                    assert_eq!(entries[2].keys[1].discrete_entry().value.to_string(), "#2");
                 }
                 other => panic!("expected TableLiteral, got {other:?}"),
             },
@@ -798,12 +970,24 @@ mod tests {
                     assert_eq!(finite_index_size(&indexes[0]), 2);
                     assert_eq!(named_index_name(&indexes[1]), "Maneuver");
                     assert_eq!(entries.len(), 4);
-                    assert_eq!(entries[0].keys[0].index.value.to_string(), "Fin(2)");
-                    assert_eq!(entries[0].keys[0].variant.value.to_string(), "#0");
-                    assert_eq!(entries[0].keys[1].index.value.to_string(), "Maneuver");
-                    assert_eq!(entries[0].keys[1].variant.value.to_string(), "Departure");
-                    assert_eq!(entries[3].keys[0].variant.value.to_string(), "#1");
-                    assert_eq!(entries[3].keys[1].variant.value.to_string(), "Correction");
+                    assert_eq!(
+                        entries[0].keys[0].discrete_index().value.to_string(),
+                        "Fin(2)"
+                    );
+                    assert_eq!(entries[0].keys[0].discrete_entry().value.to_string(), "#0");
+                    assert_eq!(
+                        entries[0].keys[1].discrete_index().value.to_string(),
+                        "Maneuver"
+                    );
+                    assert_eq!(
+                        entries[0].keys[1].discrete_entry().value.to_string(),
+                        "Departure"
+                    );
+                    assert_eq!(entries[3].keys[0].discrete_entry().value.to_string(), "#1");
+                    assert_eq!(
+                        entries[3].keys[1].discrete_entry().value.to_string(),
+                        "Correction"
+                    );
                 }
                 other => panic!("expected TableLiteral, got {other:?}"),
             },
@@ -837,15 +1021,36 @@ mod tests {
                     assert_eq!(named_index_name(&indexes[2]), "Maneuver");
                     assert_eq!(entries.len(), 8);
                     assert_eq!(entries[0].keys.len(), 3);
-                    assert_eq!(entries[0].keys[0].index.value.to_string(), "Time");
-                    assert_eq!(entries[0].keys[0].variant.value.to_string(), "T1");
-                    assert_eq!(entries[0].keys[1].index.value.to_string(), "Phase");
-                    assert_eq!(entries[0].keys[1].variant.value.to_string(), "Launch");
-                    assert_eq!(entries[0].keys[2].index.value.to_string(), "Maneuver");
-                    assert_eq!(entries[0].keys[2].variant.value.to_string(), "Departure");
-                    assert_eq!(entries[4].keys[0].variant.value.to_string(), "T2");
-                    assert_eq!(entries[4].keys[1].variant.value.to_string(), "Launch");
-                    assert_eq!(entries[4].keys[2].variant.value.to_string(), "Departure");
+                    assert_eq!(
+                        entries[0].keys[0].discrete_index().value.to_string(),
+                        "Time"
+                    );
+                    assert_eq!(entries[0].keys[0].discrete_entry().value.to_string(), "T1");
+                    assert_eq!(
+                        entries[0].keys[1].discrete_index().value.to_string(),
+                        "Phase"
+                    );
+                    assert_eq!(
+                        entries[0].keys[1].discrete_entry().value.to_string(),
+                        "Launch"
+                    );
+                    assert_eq!(
+                        entries[0].keys[2].discrete_index().value.to_string(),
+                        "Maneuver"
+                    );
+                    assert_eq!(
+                        entries[0].keys[2].discrete_entry().value.to_string(),
+                        "Departure"
+                    );
+                    assert_eq!(entries[4].keys[0].discrete_entry().value.to_string(), "T2");
+                    assert_eq!(
+                        entries[4].keys[1].discrete_entry().value.to_string(),
+                        "Launch"
+                    );
+                    assert_eq!(
+                        entries[4].keys[2].discrete_entry().value.to_string(),
+                        "Departure"
+                    );
                 }
                 other => panic!("expected TableLiteral, got {other:?}"),
             },
@@ -870,7 +1075,7 @@ mod tests {
                     };
                     assert_eq!(axis.value.display_path(), "mission.Maneuver");
                     assert_eq!(
-                        entries[0].keys[0].index.value.to_string(),
+                        entries[0].keys[0].discrete_index().value.to_string(),
                         "mission.Maneuver"
                     );
                 }
@@ -898,9 +1103,15 @@ mod tests {
                         panic!("expected named axis")
                     };
                     assert_eq!(axis.value.display_path(), "mission.Time");
-                    assert_eq!(entries[0].keys[0].index.value.to_string(), "mission.Time");
-                    assert_eq!(entries[0].keys[0].variant.value.to_string(), "T1");
-                    assert_eq!(entries[0].keys[0].additional_index_spans, vec![axis.span]);
+                    assert_eq!(
+                        entries[0].keys[0].discrete_index().value.to_string(),
+                        "mission.Time"
+                    );
+                    assert_eq!(entries[0].keys[0].discrete_entry().value.to_string(), "T1");
+                    assert_eq!(
+                        entries[0].keys[0].discrete_additional_index_spans(),
+                        vec![axis.span]
+                    );
                 }
                 other => panic!("expected TableLiteral, got {other:?}"),
             },
@@ -922,7 +1133,10 @@ mod tests {
                 }) => {
                     assert_eq!(indexes.len(), 1);
                     assert_eq!(named_index_name(&indexes[0]), "step");
-                    assert_eq!(entries[0].keys[0].index.value.to_string(), "step");
+                    assert_eq!(
+                        entries[0].keys[0].discrete_index().value.to_string(),
+                        "step"
+                    );
                 }
                 other => panic!("expected TableLiteral, got {other:?}"),
             },
@@ -999,11 +1213,20 @@ mod tests {
                     assert_eq!(named_index_name(&indexes[1]), "Phase");
                     assert_eq!(named_index_name(&indexes[2]), "Maneuver");
                     assert_eq!(entries.len(), 8);
-                    assert_eq!(entries[0].keys[0].index.value.to_string(), "Fin(2)");
-                    assert_eq!(entries[0].keys[0].variant.value.to_string(), "#0");
-                    assert_eq!(entries[0].keys[1].variant.value.to_string(), "Launch");
-                    assert_eq!(entries[0].keys[2].variant.value.to_string(), "Departure");
-                    assert_eq!(entries[4].keys[0].variant.value.to_string(), "#1");
+                    assert_eq!(
+                        entries[0].keys[0].discrete_index().value.to_string(),
+                        "Fin(2)"
+                    );
+                    assert_eq!(entries[0].keys[0].discrete_entry().value.to_string(), "#0");
+                    assert_eq!(
+                        entries[0].keys[1].discrete_entry().value.to_string(),
+                        "Launch"
+                    );
+                    assert_eq!(
+                        entries[0].keys[2].discrete_entry().value.to_string(),
+                        "Departure"
+                    );
+                    assert_eq!(entries[4].keys[0].discrete_entry().value.to_string(), "#1");
                 }
                 other => panic!("expected TableLiteral, got {other:?}"),
             },

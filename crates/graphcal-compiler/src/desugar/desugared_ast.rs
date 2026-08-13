@@ -56,6 +56,7 @@ pub type IndexDeclKind = crate::syntax::ast::IndexDeclKind<Desugared>;
 pub type Expr = crate::syntax::ast::Expr<Desugared>;
 pub type ExprKind = crate::syntax::ast::ExprKind<Desugared>;
 pub(crate) type MapEntry = crate::syntax::ast::MapEntry<Desugared>;
+pub(crate) type MapEntryKey = crate::syntax::ast::MapEntryKey<Desugared>;
 pub(crate) type IndexArg = crate::syntax::ast::IndexArg<Desugared>;
 pub(crate) type FieldInit = crate::syntax::ast::FieldInit<Desugared>;
 pub(crate) type MatchArm = crate::syntax::ast::MatchArm<Desugared>;
@@ -73,8 +74,8 @@ pub type FieldDecl = crate::syntax::ast::FieldDecl<Desugared>;
 pub use crate::syntax::ast::{
     AmbiguousGenericArg, Attribute, AttributeArg, BaseDimDecl, BinOp, BindableVisibility,
     DomainBoundKind, EncodingChannel, ForBinding, ForBindingIndex, GenericConstraint, Ident,
-    ImportDecl, ImportItem, ImportItemNamespace, ImportKind, MapEntryKey, MarkType, MatchPattern,
-    ModulePath, MulDivOp, MultiDataRow, MultiDecl, MultiDeclSlice, MultiDeclSlot, MultiHeaderCell,
-    MultiSlotAxis, MultiSlotColumnSpan, MultiSlotKind, NatExpr, PatternBinding, TableIndexSpec,
-    UnaryOp, UnitExpr, UnitExprItem, Visibility,
+    ImportDecl, ImportItem, ImportItemNamespace, ImportKind, MapKeyAxisSyntax, MarkType,
+    MatchPattern, ModulePath, MulDivOp, MultiDataRow, MultiDecl, MultiDeclSlice, MultiDeclSlot,
+    MultiHeaderCell, MultiSlotAxis, MultiSlotColumnSpan, MultiSlotKind, NatExpr, PatternBinding,
+    TableIndexSpec, UnaryOp, UnitExpr, UnitExprItem, Visibility,
 };

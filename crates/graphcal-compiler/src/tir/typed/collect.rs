@@ -578,6 +578,18 @@ fn collect_resolved_collection_refs_from_expr_inner(
                             )?;
                         }
                         hir::expr::MapEntryKey::FinitePosition { .. } => {}
+                        hir::expr::MapEntryKey::Expression { axis, expr } => {
+                            if let hir::expr::MapKeyAxis::Explicit(index) = axis {
+                                record_resolved_collection_index(
+                                    &index.value,
+                                    ctx,
+                                    src,
+                                    index.span,
+                                    refs,
+                                )?;
+                            }
+                            collect_resolved_collection_refs_from_expr(expr, ctx, src, refs)?;
+                        }
                     }
                 }
                 collect_resolved_collection_refs_from_expr(&entry.value, ctx, src, refs)?;

@@ -1244,6 +1244,11 @@ pub struct DagSemanticBody {
         crate::tir::materialized_shape::MaterializedExpressionKey,
         crate::tir::materialized_shape::MaterializedShape,
     >,
+    /// Type-checked semantic axes for map literals, including contextual keys.
+    pub map_literal_axes: HashMap<
+        crate::tir::map_literal_fact::MapLiteralKey,
+        crate::tir::map_literal_fact::CheckedMapLiteralAxes,
+    >,
     /// Checked structured display and plot-channel presentation facts.
     pub presentation: crate::tir::presentation::DagPresentationFacts,
 }
@@ -1717,6 +1722,21 @@ impl DagTIR {
         self.semantic.materialized_shapes.get(
             &crate::tir::materialized_shape::MaterializedExpressionKey::new(owner.clone(), span),
         )
+    }
+
+    /// Look up the semantic axes established for one checked map literal.
+    #[must_use]
+    pub fn map_literal_axes(
+        &self,
+        owner: &ResolvedDeclName,
+        span: Span,
+    ) -> Option<&crate::tir::map_literal_fact::CheckedMapLiteralAxes> {
+        self.semantic
+            .map_literal_axes
+            .get(&crate::tir::map_literal_fact::MapLiteralKey::new(
+                owner.clone(),
+                span,
+            ))
     }
 
     /// Explicit template-instance edges owned by this DAG.
