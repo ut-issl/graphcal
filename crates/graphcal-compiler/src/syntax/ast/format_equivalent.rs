@@ -1372,17 +1372,37 @@ impl FormatEquivalent for MultiDeclSharedAxes {
 
 impl FormatEquivalent for MapEntryKey {
     fn format_equivalent(&self, other: &Self) -> bool {
-        let Self {
-            index,
-            additional_index_spans: _,
-            variant,
-        } = self;
-        let Self {
-            index: other_index,
-            additional_index_spans: _,
-            variant: other_variant,
-        } = other;
-        index.format_equivalent(other_index) && variant.format_equivalent(other_variant)
+        match (self, other) {
+            (
+                Self::Discrete { index, entry, .. },
+                Self::Discrete {
+                    index: other_index,
+                    entry: other_entry,
+                    ..
+                },
+            ) => index.format_equivalent(other_index) && entry.format_equivalent(other_entry),
+            (
+                Self::Expression { axis, expr },
+                Self::Expression {
+                    axis: other_axis,
+                    expr: other_expr,
+                },
+            ) => {
+                let axes_equivalent = match (axis, other_axis) {
+                    (
+                        crate::syntax::ast::MapKeyAxisSyntax::Explicit(axis),
+                        crate::syntax::ast::MapKeyAxisSyntax::Explicit(other_axis),
+                    ) => axis.format_equivalent(other_axis),
+                    (
+                        crate::syntax::ast::MapKeyAxisSyntax::Contextual,
+                        crate::syntax::ast::MapKeyAxisSyntax::Contextual,
+                    ) => true,
+                    _ => false,
+                };
+                axes_equivalent && expr.format_equivalent(other_expr)
+            }
+            _ => false,
+        }
     }
 }
 
@@ -1675,18 +1695,23 @@ impl FormatEquivalent for RawExprSugar {
 }
 
 #[derive(PartialEq, Eq, Hash)]
-struct SpanFreeMapEntryKey<'a> {
+struct SpanFreeDiscreteMapEntryKey<'a> {
     index: &'a crate::syntax::ast::MapEntryIndex,
-    variant: &'a IndexEntryKey,
+    entry: &'a IndexEntryKey,
 }
 
-fn span_free_table_entry_key(entry: &MapEntry) -> Vec<SpanFreeMapEntryKey<'_>> {
+fn span_free_discrete_table_entry_key(
+    entry: &MapEntry,
+) -> Option<Vec<SpanFreeDiscreteMapEntryKey<'_>>> {
     entry
         .keys
         .iter()
-        .map(|key| SpanFreeMapEntryKey {
-            index: &key.index.value,
-            variant: &key.variant.value,
+        .map(|key| match key {
+            MapEntryKey::Discrete { index, entry, .. } => Some(SpanFreeDiscreteMapEntryKey {
+                index: &index.value,
+                entry: &entry.value,
+            }),
+            MapEntryKey::Expression { .. } => None,
         })
         .collect()
 }
@@ -1714,30 +1739,48 @@ fn table_entries_format_equivalent_by(
         return true;
     }
 
-    // Reordered entries still have multiset semantics. Index by the typed,
-    // span-free key so each entry searches only the values for its exact key,
-    // rather than rescanning the whole right-hand table.
-    let mut rhs_by_key: HashMap<Vec<SpanFreeMapEntryKey<'_>>, Vec<&MapEntry>> = rhs.iter().fold(
-        HashMap::with_capacity(rhs.len()),
-        |mut entries_by_key, entry| {
-            entries_by_key
-                .entry(span_free_table_entry_key(entry))
-                .or_default()
-                .push(entry);
-            entries_by_key
-        },
-    );
+    // Preserve the linear hashed path for the common discrete-key case.
+    if lhs
+        .iter()
+        .chain(rhs)
+        .all(|entry| span_free_discrete_table_entry_key(entry).is_some())
+    {
+        let mut rhs_by_key: HashMap<Vec<SpanFreeDiscreteMapEntryKey<'_>>, Vec<&MapEntry>> =
+            HashMap::with_capacity(rhs.len());
+        for entry in rhs {
+            let Some(key) = span_free_discrete_table_entry_key(entry) else {
+                return false;
+            };
+            rhs_by_key.entry(key).or_default().push(entry);
+        }
+        return lhs.iter().all(|entry| {
+            let Some(key) = span_free_discrete_table_entry_key(entry) else {
+                return false;
+            };
+            rhs_by_key
+                .get_mut(&key)
+                .and_then(|candidates| {
+                    candidates
+                        .iter()
+                        .position(|candidate| entries_equivalent(entry, candidate))
+                        .map(|position| candidates.swap_remove(position))
+                })
+                .is_some()
+        });
+    }
 
+    // Coordinate keys carry structured expressions and intentionally are not
+    // flattened into an ad-hoc string/hash encoding. Match those entries
+    // structurally while tracking consumed candidates.
+    let mut consumed = vec![false; rhs.len()];
     lhs.iter().all(|entry| {
-        rhs_by_key
-            .get_mut(&span_free_table_entry_key(entry))
-            .and_then(|candidates| {
-                candidates
-                    .iter()
-                    .position(|candidate| entries_equivalent(entry, candidate))
-                    .map(|position| candidates.swap_remove(position))
+        rhs.iter()
+            .enumerate()
+            .find(|(index, candidate)| !consumed[*index] && entries_equivalent(entry, candidate))
+            .is_some_and(|(index, _)| {
+                consumed[index] = true;
+                true
             })
-            .is_some()
     })
 }
 

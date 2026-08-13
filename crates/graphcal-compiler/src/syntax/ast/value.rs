@@ -988,17 +988,62 @@ impl TableIndexSpec {
     }
 }
 
-/// A single key in a map literal entry: `Index.Variant`.
+/// A single key in a map literal entry.
 ///
 /// Table sugar can mention the same semantic index more than once for one
 /// desugared key: once in `table[...]` and again in a qualified slice or
 /// heterogeneous header label. `additional_index_spans` preserves those
 /// source references for editor features without duplicating the key value.
 #[derive(Debug, Clone)]
-pub struct MapEntryKey {
-    pub index: Spanned<MapEntryIndex>,
-    pub additional_index_spans: Vec<Span>,
-    pub variant: Spanned<IndexEntryKey>,
+pub enum MapEntryKey<P: Phase = Raw> {
+    /// A named-label or structural finite position key.
+    Discrete {
+        index: Spanned<MapEntryIndex>,
+        additional_index_spans: Vec<Span>,
+        entry: Spanned<IndexEntryKey>,
+    },
+    /// An expression-shaped key whose coordinate semantics are checked later.
+    Expression {
+        axis: MapKeyAxisSyntax,
+        expr: Expr<P>,
+    },
+}
+
+/// Where the axis for an expression-shaped map key comes from.
+#[derive(Debug, Clone)]
+pub enum MapKeyAxisSyntax {
+    /// Written in table metadata such as `table[Altitude]`.
+    Explicit(Spanned<NamePath>),
+    /// Inferred from this map literal's expected indexed type.
+    Contextual,
+}
+
+#[cfg(test)]
+impl<P: Phase> MapEntryKey<P> {
+    pub(crate) fn discrete_index(&self) -> &Spanned<MapEntryIndex> {
+        let Self::Discrete { index, .. } = self else {
+            panic!("expected a discrete map key")
+        };
+        index
+    }
+
+    pub(crate) fn discrete_entry(&self) -> &Spanned<IndexEntryKey> {
+        let Self::Discrete { entry, .. } = self else {
+            panic!("expected a discrete map key")
+        };
+        entry
+    }
+
+    pub(crate) fn discrete_additional_index_spans(&self) -> &[Span] {
+        let Self::Discrete {
+            additional_index_spans,
+            ..
+        } = self
+        else {
+            panic!("expected a discrete map key")
+        };
+        additional_index_spans
+    }
 }
 
 /// An entry in a map literal.
@@ -1007,7 +1052,7 @@ pub struct MapEntryKey {
 /// Multi-axis:  `(Phase.Launch, Maneuver.Departure): 2.46 km/s` (keys has 2+ elements)
 #[derive(Debug, Clone)]
 pub struct MapEntry<P: Phase = Raw> {
-    pub keys: NonEmpty<MapEntryKey>,
+    pub keys: NonEmpty<MapEntryKey<P>>,
     pub value: Expr<P>,
 }
 

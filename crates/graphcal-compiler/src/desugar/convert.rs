@@ -635,7 +635,23 @@ impl From<ExprKind<Raw>> for ExprKind<Desugared> {
 impl From<MapEntry<Raw>> for MapEntry<Desugared> {
     fn from(m: MapEntry<Raw>) -> Self {
         Self {
-            keys: m.keys,
+            keys: m.keys.map(|key| match key {
+                crate::syntax::ast::MapEntryKey::Discrete {
+                    index,
+                    additional_index_spans,
+                    entry,
+                } => crate::syntax::ast::MapEntryKey::Discrete {
+                    index,
+                    additional_index_spans,
+                    entry,
+                },
+                crate::syntax::ast::MapEntryKey::Expression { axis, expr } => {
+                    crate::syntax::ast::MapEntryKey::Expression {
+                        axis,
+                        expr: expr.into(),
+                    }
+                }
+            }),
             value: m.value.into(),
         }
     }

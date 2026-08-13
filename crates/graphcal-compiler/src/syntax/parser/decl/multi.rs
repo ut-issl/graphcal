@@ -411,13 +411,13 @@ impl Parser<'_> {
                             span: label_axis.span.into(),
                         });
                     }
-                    keys.push(MapEntryKey {
+                    keys.push(MapEntryKey::Discrete {
                         index: Spanned::new(
                             MapEntryIndex::Named(label_axis.value),
                             label_axis.span,
                         ),
                         additional_index_spans: vec![axis.span],
-                        variant: Spanned::new(IndexEntryKey::named(variant.value), variant.span),
+                        entry: Spanned::new(IndexEntryKey::named(variant.value), variant.span),
                     });
                 }
                 TableIndexSpec::Finite { cardinality, span } => {
@@ -439,10 +439,10 @@ impl Parser<'_> {
                         });
                     }
                     let variant_span = hash_span.merge(num_span);
-                    keys.push(MapEntryKey {
+                    keys.push(MapEntryKey::Discrete {
                         index: Spanned::new(MapEntryIndex::Finite(*cardinality), *span),
                         additional_index_spans: Vec::new(),
-                        variant: Spanned::new(IndexEntryKey::position(value), variant_span),
+                        entry: Spanned::new(IndexEntryKey::position(value), variant_span),
                     });
                 }
             }
@@ -1086,8 +1086,14 @@ param      power_mode:        Bool[Component, OperationMode]
                 }) => {
                     assert_eq!(indexes.len(), 2);
                     assert_eq!(entries.len(), 4); // 2 components × 2 modes
-                    assert_eq!(entries[0].keys[0].index.value.to_string(), "Component");
-                    assert_eq!(entries[0].keys[1].index.value.to_string(), "OperationMode");
+                    assert_eq!(
+                        entries[0].keys[0].discrete_index().value.to_string(),
+                        "Component"
+                    );
+                    assert_eq!(
+                        entries[0].keys[1].discrete_index().value.to_string(),
+                        "OperationMode"
+                    );
                 }
                 other => panic!("expected TableLiteral, got {other:?}"),
             },
@@ -1138,7 +1144,10 @@ param q: Int[Phase, Component]
         assert_eq!(multi.slices().len(), 2);
         assert_eq!(multi.slices()[0].prefix_keys().len(), 1);
         assert_eq!(
-            multi.slices()[0].prefix_keys()[0].index.value.to_string(),
+            multi.slices()[0].prefix_keys()[0]
+                .discrete_index()
+                .value
+                .to_string(),
             "Phase"
         );
 
@@ -1159,8 +1168,8 @@ param q: Int[Phase, Component]
                     assert_eq!(entries.len(), 2); // 2 phases × 1 component
                     for e in entries {
                         assert_eq!(e.keys.len(), 2);
-                        assert_eq!(e.keys[0].index.value.to_string(), "Phase");
-                        assert_eq!(e.keys[1].index.value.to_string(), "Component");
+                        assert_eq!(e.keys[0].discrete_index().value.to_string(), "Phase");
+                        assert_eq!(e.keys[1].discrete_index().value.to_string(), "Component");
                     }
                 }
                 other => panic!("expected TableLiteral, got {other:?}"),
@@ -1255,7 +1264,10 @@ param m: Bool[mission.Phase, mission.Component, mission.Mode]
         assert_eq!(axis.value.display_path(), "mission.Mode");
         assert_eq!(variant.value.as_str(), "Safe");
         assert_eq!(
-            multi.slices()[0].prefix_keys()[0].index.value.to_string(),
+            multi.slices()[0].prefix_keys()[0]
+                .discrete_index()
+                .value
+                .to_string(),
             "mission.Phase"
         );
     }

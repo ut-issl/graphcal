@@ -498,6 +498,40 @@ The coordinate loop variable `t` is a key of the `TimeStep` axis; the
 quantity coordinate it stands on is extracted explicitly with `coord(t)`
 (see [Index Keys](#index-keys)).
 
+### Construction via Quantity-Keyed Literals
+
+A concrete coordinate axis can also be populated directly with coordinate
+quantities. In a plain map, the axis of each quantity key is inferred from the
+declaration's indexed type:
+
+```
+index Altitude = range(300.0 km, 320.0 km, step: 10.0 km);
+
+node density: (Mass/Length^3)[Altitude] = {
+    300.0 km: 1.20 kg/m^3,
+    310.0 km: 1.15 kg/m^3,
+    320.0 km: 1.10 kg/m^3,
+};
+```
+
+Quantity keys must be statically evaluable, have the coordinate index's
+dimension, and lie on an actual generated grid point. Dynamic units and runtime
+references are rejected. As with named-index maps, every grid point must appear
+exactly once; entry order is not significant.
+
+Tuple map keys may mix coordinate quantities and named labels. A `table`
+declares its axes explicitly, so coordinate quantities can be used as row,
+column, or slice labels:
+
+```
+node envelope: Pressure[Maneuver, Altitude] = table[Maneuver, Altitude] {
+    : 300.0 km, 310.0 km, 320.0 km;
+    Departure: 101.0 kPa, 95.0 kPa, 90.0 kPa;
+    Correction: 100.0 kPa, 94.0 kPa, 89.0 kPa;
+    Insertion: 99.0 kPa, 93.0 kPa, 88.0 kPa;
+};
+```
+
 ### Construction via Map Literal with `for` Values
 
 You can also use a map literal where each named-label entry contains a
@@ -636,6 +670,8 @@ apply to multi-declaration shared axes: a `Fin` row axis has unlabeled rows, and
 a `Fin` slice axis uses `[#N]` sections.
 
 The `table` expression is pure syntax sugar -- it desugars to a map literal at parse time.
+For a coordinate axis, use coordinate quantities instead of named labels in
+the corresponding rows, columns, or slice headers.
 
 ## Multi-declarations
 

@@ -21,14 +21,17 @@ use crate::hir::{self, ConstRef, FunctionRef, NominalConstructor, NominalTypeDef
 use crate::nat::NatOverflowError;
 use crate::registry::declared_type::IndexTypeRef;
 use crate::registry::error::GraphcalError;
-use crate::registry::types::{IndexCardinality, SemanticRegistry, TypeGenericConstraint};
+use crate::registry::types::{
+    IndexCardinality, IndexCategory, IndexKind, SemanticRegistry, TypeGenericConstraint,
+};
 use crate::syntax::ast::UnaryOp;
-use crate::syntax::index_name::{IndexEntryKey, ResolvedIndexVariant};
+use crate::syntax::index_name::{IndexEntryKey, ResolvedIndexName, ResolvedIndexVariant};
 use crate::syntax::module_name::ScopedName;
 use crate::syntax::names::NamePath;
 use crate::syntax::non_empty::NonEmpty;
 use crate::syntax::span::Span;
 use crate::syntax::type_name::{FieldName, GenericParamName};
+use crate::tir::map_literal_fact::{CheckedMapLiteralAxes, MapLiteralKey};
 use crate::tir::materialized_shape::{
     MaterializedExpressionKey, MaterializedShape, MaterializedShapeError,
 };
@@ -83,6 +86,7 @@ enum NominalDependencyTracking {
 #[derive(Clone, Default)]
 pub(in crate::tir::dim_check) struct MaterializedShapeCollector {
     shapes: Rc<RefCell<HashMap<MaterializedExpressionKey, MaterializedShape>>>,
+    map_literal_axes: Rc<RefCell<HashMap<MapLiteralKey, CheckedMapLiteralAxes>>>,
 }
 
 impl MaterializedShapeCollector {
@@ -90,6 +94,31 @@ impl MaterializedShapeCollector {
         &self,
     ) -> HashMap<MaterializedExpressionKey, MaterializedShape> {
         self.shapes.borrow().clone()
+    }
+
+    pub(in crate::tir::dim_check) fn map_literal_axes_snapshot(
+        &self,
+    ) -> HashMap<MapLiteralKey, CheckedMapLiteralAxes> {
+        self.map_literal_axes.borrow().clone()
+    }
+
+    fn record_map_literal_axes(
+        &self,
+        owner: Option<&ResolvedDeclName>,
+        expr: &hir::Expr,
+        axes: &[MapLiteralAxis],
+    ) {
+        let Some(owner) = owner else {
+            return;
+        };
+        let axes = axes
+            .iter()
+            .map(|axis| axis.index.type_ref().clone())
+            .collect();
+        self.map_literal_axes.borrow_mut().insert(
+            MapLiteralKey::new(owner.clone(), expr.span),
+            CheckedMapLiteralAxes::new(axes),
+        );
     }
 
     fn record(
@@ -574,8 +603,45 @@ pub(in crate::tir::dim_check) fn infer_hir_type_with_materialized_shapes_and_can
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the ordinary materialized-shape inference entry point"
+)]
+pub(in crate::tir::dim_check) fn infer_hir_type_with_expected_and_materialized_shapes_and_cancellation(
+    expr: &hir::Expr,
+    expected: &InferredType,
+    owner_decl_name: Option<&ResolvedDeclName>,
+    declared_types: &HashMap<ScopedName, DeclaredType>,
+    dag: &crate::tir::typed::DagTIR,
+    tir: &crate::tir::typed::TIR,
+    registry: &SemanticRegistry,
+    builtin_fns: &crate::registry::builtins::BuiltinFunctions,
+    src: &NamedSource<Arc<String>>,
+    cancellation: &crate::cancellation::CancellationToken,
+    collector: MaterializedShapeCollector,
+) -> Result<InferredType, GraphcalError> {
+    let locals = HirLocalTypes::root_with_materialized_shapes(
+        cancellation,
+        collector,
+        owner_decl_name.cloned(),
+    );
+    infer_hir_type_with_expected(
+        expr,
+        Some(expected),
+        owner_decl_name,
+        declared_types,
+        &locals,
+        dag,
+        tir,
+        registry,
+        builtin_fns,
+        src,
+    )
+}
+
 pub(in crate::tir::dim_check) fn infer_hir_type_with_nominal_dependencies_and_cancellation(
     expr: &hir::Expr,
+    expected: &InferredType,
     owner_decl_name: &ResolvedDeclName,
     declared_types: &HashMap<ScopedName, DeclaredType>,
     dag: &crate::tir::typed::DagTIR,
@@ -586,8 +652,9 @@ pub(in crate::tir::dim_check) fn infer_hir_type_with_nominal_dependencies_and_ca
     cancellation: &crate::cancellation::CancellationToken,
 ) -> Result<(InferredType, HashSet<NominalOverrideIdentity>), GraphcalError> {
     let (locals, collector) = HirLocalTypes::collecting_root(cancellation);
-    let inferred = infer_hir_type(
+    let inferred = infer_hir_type_with_expected(
         expr,
+        Some(expected),
         Some(owner_decl_name),
         declared_types,
         &locals,
@@ -615,12 +682,43 @@ fn infer_hir_type(
     builtin_fns: &crate::registry::builtins::BuiltinFunctions,
     src: &NamedSource<Arc<String>>,
 ) -> Result<InferredType, GraphcalError> {
+    infer_hir_type_with_expected(
+        expr,
+        None,
+        owner_decl_name,
+        declared_types,
+        local_types,
+        dag,
+        tir,
+        registry,
+        builtin_fns,
+        src,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors infer_hir_type's signature and adds contextual expected type"
+)]
+fn infer_hir_type_with_expected(
+    expr: &hir::Expr,
+    expected: Option<&InferredType>,
+    owner_decl_name: Option<&ResolvedDeclName>,
+    declared_types: &HashMap<ScopedName, DeclaredType>,
+    local_types: &HirLocalTypes<'_>,
+    dag: &crate::tir::typed::DagTIR,
+    tir: &crate::tir::typed::TIR,
+    registry: &SemanticRegistry,
+    builtin_fns: &crate::registry::builtins::BuiltinFunctions,
+    src: &NamedSource<Arc<String>>,
+) -> Result<InferredType, GraphcalError> {
     local_types.checkpoint()?;
     // Recursion choke point: inference recurses once per tree level
     // (unbounded for left-nested operator chains).
     crate::stack::with_stack_growth(|| {
         infer_hir_type_inner(
             expr,
+            expected,
             owner_decl_name,
             declared_types,
             local_types,
@@ -639,6 +737,7 @@ fn infer_hir_type(
 )]
 fn infer_hir_type_inner(
     expr: &hir::Expr,
+    expected: Option<&InferredType>,
     owner_decl_name: Option<&ResolvedDeclName>,
     declared_types: &HashMap<ScopedName, DeclaredType>,
     local_types: &HirLocalTypes<'_>,
@@ -885,6 +984,7 @@ fn infer_hir_type_inner(
         hir::ExprKind::MapLiteral { entries } => infer_hir_map_literal(
             expr,
             entries,
+            expected,
             owner_decl_name,
             declared_types,
             local_types,
@@ -4245,20 +4345,30 @@ fn resolve_applied_generic_args(
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum MapLiteralVariantKey {
     Declared(ResolvedIndexVariant),
-    Finite { form: NatPolyForm, position: u64 },
+    Coordinate {
+        index: ResolvedIndexName,
+        position: u64,
+    },
+    Finite {
+        form: NatPolyForm,
+        position: u64,
+    },
 }
 
 impl MapLiteralVariantKey {
     fn entry_key(&self) -> IndexEntryKey {
         match self {
             Self::Declared(resolved) => IndexEntryKey::named(resolved.variant().clone()),
-            Self::Finite { position, .. } => IndexEntryKey::position(*position),
+            Self::Coordinate { position, .. } | Self::Finite { position, .. } => {
+                IndexEntryKey::position(*position)
+            }
         }
     }
 
     fn display(&self) -> String {
         match self {
             Self::Declared(resolved) => resolved.to_string(),
+            Self::Coordinate { index, position } => format!("{index}.#{position}"),
             Self::Finite { form, position } => format!("Fin({}).#{position}", form.format()),
         }
     }
@@ -4267,6 +4377,7 @@ impl MapLiteralVariantKey {
 #[derive(Debug, Clone)]
 struct MapLiteralAxis {
     index: InferredIndex,
+    category: IndexCategory,
     entry_keys: Vec<IndexEntryKey>,
 }
 
@@ -4340,26 +4451,39 @@ fn first_missing_map_tuple(
 
 impl MapLiteralAxis {
     fn variant_key(&self, key: IndexEntryKey) -> Result<MapLiteralVariantKey, IndexEntryKey> {
-        match (self.index.type_ref(), key) {
-            (IndexTypeRef::Declared(reference), IndexEntryKey::Named(variant)) => {
-                Ok(MapLiteralVariantKey::Declared(ResolvedIndexVariant::new(
-                    reference.resolved().clone(),
-                    variant,
-                )))
-            }
-            (IndexTypeRef::Finite(reference), IndexEntryKey::Position(position)) => {
-                Ok(MapLiteralVariantKey::Finite {
-                    form: reference.form(),
-                    position,
-                })
-            }
-            (_, incompatible) => Err(incompatible),
+        match (self.category, self.index.type_ref(), key) {
+            (
+                IndexCategory::Named,
+                IndexTypeRef::Declared(reference),
+                IndexEntryKey::Named(variant),
+            ) => Ok(MapLiteralVariantKey::Declared(ResolvedIndexVariant::new(
+                reference.resolved().clone(),
+                variant,
+            ))),
+            (
+                IndexCategory::Coordinate,
+                IndexTypeRef::Declared(reference),
+                IndexEntryKey::Position(position),
+            ) => Ok(MapLiteralVariantKey::Coordinate {
+                index: reference.resolved().clone(),
+                position,
+            }),
+            (
+                IndexCategory::Finite,
+                IndexTypeRef::Finite(reference),
+                IndexEntryKey::Position(position),
+            ) => Ok(MapLiteralVariantKey::Finite {
+                form: reference.form(),
+                position,
+            }),
+            (_, _, incompatible) => Err(incompatible),
         }
     }
 }
 
 fn inferred_index_for_hir_map_key(
     key: &hir::expr::MapEntryKey,
+    contextual_axis: Option<&InferredIndex>,
     src: &NamedSource<Arc<String>>,
 ) -> Result<InferredIndex, GraphcalError> {
     match key {
@@ -4370,17 +4494,205 @@ fn inferred_index_for_hir_map_key(
             InferredIndex::from_finite_index_form(NatPolyForm::from_constant(*size))
                 .map_err(|err| finite_index_error(err, src, position.span))
         }
+        hir::expr::MapEntryKey::Expression { axis, expr } => match axis {
+            hir::expr::MapKeyAxis::Explicit(index) => {
+                Ok(InferredIndex::from_resolved(index.value.clone()))
+            }
+            hir::expr::MapKeyAxis::Contextual => {
+                contextual_axis
+                    .cloned()
+                    .ok_or_else(|| GraphcalError::EvalError {
+                        message: "expression-shaped map keys require an expected coordinate index"
+                            .to_string(),
+                        src: src.clone(),
+                        span: expr.span.into(),
+                    })
+            }
+        },
     }
 }
 
-fn hir_map_entry_key(key: &hir::expr::MapEntryKey) -> IndexEntryKey {
+pub(in crate::tir::dim_check) fn static_coordinate_quantity(
+    expr: &hir::Expr,
+    tir: &crate::tir::typed::TIR,
+    src: &NamedSource<Arc<String>>,
+) -> Result<(f64, Dimension), GraphcalError> {
+    let error = |message: String, span: Span| GraphcalError::EvalError {
+        message,
+        src: src.clone(),
+        span: span.into(),
+    };
+    let finite = |value: f64, span: Span| {
+        value.is_finite().then_some(value).ok_or_else(|| {
+            error(
+                format!("coordinate key must evaluate to a finite quantity, got {value}"),
+                span,
+            )
+        })
+    };
+    match &expr.kind {
+        hir::ExprKind::Number(value) => Ok((finite(*value, expr.span)?, Dimension::dimensionless())),
+        hir::ExprKind::QuantityLiteral { value, unit } => {
+            let mut dimension = Dimension::dimensionless();
+            let mut scale = 1.0;
+            for term in &unit.terms {
+                let info = tir.unit_info(term.name.value.resolved()).ok_or_else(|| {
+                    error(format!("unknown unit `{}`", term.name.value), term.name.span)
+                })?;
+                let Some(term_scale) = info.scale.as_static() else {
+                    return Err(error(
+                        "coordinate keys cannot use dynamic units".to_string(),
+                        term.name.span,
+                    ));
+                };
+                let term_dimension = info.dimension.pow(term.power).map_err(|_| {
+                    GraphcalError::DimensionOverflow { src: src.clone(), span: term.name.span.into() }
+                })?;
+                let powered_scale = crate::registry::unit::pow_scale(term_scale, term.power);
+                match term.op {
+                    crate::syntax::ast::MulDivOp::Mul => {
+                        dimension = dimension.checked_mul(&term_dimension).map_err(|_| GraphcalError::DimensionOverflow { src: src.clone(), span: unit.span.into() })?;
+                        scale *= powered_scale;
+                    }
+                    crate::syntax::ast::MulDivOp::Div => {
+                        dimension = dimension.checked_div(&term_dimension).map_err(|_| GraphcalError::DimensionOverflow { src: src.clone(), span: unit.span.into() })?;
+                        scale /= powered_scale;
+                    }
+                }
+            }
+            Ok((finite(*value * scale, expr.span)?, dimension))
+        }
+        hir::ExprKind::ConstRef(target) => match &target.value {
+            ConstRef::Builtin(value) => Ok((value.value(), Dimension::dimensionless())),
+            _ => Err(error(
+                "coordinate keys must be statically evaluable quantities; runtime references are not supported".to_string(),
+                target.span,
+            )),
+        },
+        hir::ExprKind::UnaryOp { op: UnaryOp::Neg, operand } => {
+            let (value, dimension) = static_coordinate_quantity(operand, tir, src)?;
+            Ok((finite(-value, expr.span)?, dimension))
+        }
+        hir::ExprKind::BinOp { op, lhs, rhs } => {
+            let (lhs_value, lhs_dimension) = static_coordinate_quantity(lhs, tir, src)?;
+            let (rhs_value, rhs_dimension) = static_coordinate_quantity(rhs, tir, src)?;
+            let overflow = || GraphcalError::DimensionOverflow { src: src.clone(), span: expr.span.into() };
+            let (value, dimension) = match op {
+                crate::syntax::ast::BinOp::Add | crate::syntax::ast::BinOp::Sub => {
+                    if lhs_dimension != rhs_dimension {
+                        return Err(error("coordinate key addition or subtraction requires matching dimensions".to_string(), expr.span));
+                    }
+                    let value = if *op == crate::syntax::ast::BinOp::Add { lhs_value + rhs_value } else { lhs_value - rhs_value };
+                    (value, lhs_dimension)
+                }
+                crate::syntax::ast::BinOp::Mul => (lhs_value * rhs_value, lhs_dimension.checked_mul(&rhs_dimension).map_err(|_| overflow())?),
+                crate::syntax::ast::BinOp::Div => (lhs_value / rhs_value, lhs_dimension.checked_div(&rhs_dimension).map_err(|_| overflow())?),
+                _ => return Err(error("coordinate keys support only static quantity arithmetic".to_string(), expr.span)),
+            };
+            Ok((finite(value, expr.span)?, dimension))
+        }
+        _ => Err(error(
+            "coordinate keys must be statically evaluable quantities; runtime expressions are not supported".to_string(),
+            expr.span,
+        )),
+    }
+}
+
+fn hir_map_entry_key(
+    key: &hir::expr::MapEntryKey,
+    axis: &MapLiteralAxis,
+    tir: &crate::tir::typed::TIR,
+    src: &NamedSource<Arc<String>>,
+) -> Result<IndexEntryKey, GraphcalError> {
     match key {
         hir::expr::MapEntryKey::IndexVariant(variant) => {
-            IndexEntryKey::named(variant.variant.variant().clone())
+            Ok(IndexEntryKey::named(variant.variant.variant().clone()))
         }
         hir::expr::MapEntryKey::FinitePosition { position, .. } => {
-            IndexEntryKey::position(position.value)
+            Ok(IndexEntryKey::position(position.value))
         }
+        hir::expr::MapEntryKey::Expression {
+            axis: key_axis,
+            expr,
+        } => {
+            let IndexTypeRef::Declared(index_ref) = axis.index.type_ref() else {
+                return Err(error_for_coordinate_key(
+                    "expression-shaped map keys require a declared coordinate index".to_string(),
+                    src,
+                    expr.span,
+                ));
+            };
+            let index = index_ref.resolved();
+            if let hir::expr::MapKeyAxis::Explicit(explicit) = key_axis
+                && explicit.value != *index
+            {
+                return Err(GraphcalError::IndexMismatch {
+                    expected: axis.index.name(),
+                    found: explicit.value.to_unowned_def_name(),
+                    src: src.clone(),
+                    span: explicit.span.into(),
+                });
+            }
+            let definition =
+                tir.declared_index_def(index)
+                    .ok_or_else(|| GraphcalError::UnknownIndex {
+                        name: index.to_unowned_def_name(),
+                        src: src.clone(),
+                        span: expr.span.into(),
+                    })?;
+            let IndexKind::Coordinate(data) = &definition.kind else {
+                return Err(error_for_coordinate_key(
+                    format!("index `{index}` is not a coordinate index"),
+                    src,
+                    expr.span,
+                ));
+            };
+            let (value, dimension) = static_coordinate_quantity(expr, tir, src)?;
+            if dimension != data.dimension {
+                return Err(error_for_coordinate_key(
+                    format!(
+                        "coordinate key dimension for `{}` does not match: expected {:?}, found {:?}",
+                        index, data.dimension, dimension
+                    ),
+                    src,
+                    expr.span,
+                ));
+            }
+            let Some(position) = data.position_of(value) else {
+                let display_coordinate = |coordinate: f64| {
+                    let value = coordinate / data.display_scale;
+                    data.display_label
+                        .as_ref()
+                        .map_or_else(|| value.to_string(), |label| format!("{value} {label}"))
+                };
+                let nearest = data.nearest_coordinate(value).map_or_else(
+                    || "none".to_string(),
+                    |(_, nearest)| display_coordinate(nearest),
+                );
+                return Err(error_for_coordinate_key(
+                    format!(
+                        "coordinate key {} does not lie on coordinate index `{}`; nearest grid point is {nearest}",
+                        display_coordinate(value),
+                        index.as_str(),
+                    ),
+                    src,
+                    expr.span,
+                ));
+            };
+            Ok(IndexEntryKey::position(position as u64))
+        }
+    }
+}
+
+fn error_for_coordinate_key(
+    message: String,
+    src: &NamedSource<Arc<String>>,
+    span: Span,
+) -> GraphcalError {
+    GraphcalError::EvalError {
+        message,
+        src: src.clone(),
+        span: span.into(),
     }
 }
 
@@ -4392,6 +4704,7 @@ fn hir_map_entry_key(key: &hir::expr::MapEntryKey) -> IndexEntryKey {
 fn infer_hir_map_literal(
     expr: &hir::Expr,
     entries: &[hir::expr::MapEntry],
+    expected: Option<&InferredType>,
     owner_decl_name: Option<&ResolvedDeclName>,
     declared_types: &HashMap<ScopedName, DeclaredType>,
     local_types: &HirLocalTypes<'_>,
@@ -4422,6 +4735,17 @@ fn infer_hir_map_literal(
         });
     };
     let arity = first_entry.keys.len();
+    let mut expected_axes = Vec::with_capacity(arity);
+    let mut expected_element = expected.cloned();
+    for _ in 0..arity {
+        let Some(InferredType::Indexed { index, element }) = expected_element else {
+            expected_axes.clear();
+            expected_element = None;
+            break;
+        };
+        expected_axes.push(index);
+        expected_element = Some(*element);
+    }
     for entry in entries.iter().skip(1) {
         if entry.keys.len() != arity {
             return Err(GraphcalError::EvalError {
@@ -4436,8 +4760,8 @@ fn infer_hir_map_literal(
     }
 
     let mut axes = Vec::with_capacity(arity);
-    for key in &first_entry.keys {
-        let index = inferred_index_for_hir_map_key(key, src)?;
+    for (position, key) in first_entry.keys.iter().enumerate() {
+        let index = inferred_index_for_hir_map_key(key, expected_axes.get(position), src)?;
         let idx_def =
             super::index_def_for_inferred(&index, Some(dag), registry).ok_or_else(|| {
                 GraphcalError::UnknownIndex {
@@ -4446,24 +4770,15 @@ fn infer_hir_map_literal(
                     span: expr.span.into(),
                 }
             })?;
-        if idx_def.is_coordinate() {
-            return Err(GraphcalError::EvalError {
-                message: format!(
-                    "coordinate index `{}` cannot be used as a map/table literal key; use a `for` comprehension instead",
-                    index.name()
-                ),
-                src: src.clone(),
-                span: expr.span.into(),
-            });
-        }
         axes.push(MapLiteralAxis {
             index,
+            category: idx_def.category(),
             entry_keys: idx_def.entry_keys(),
         });
     }
     for entry in entries.iter().skip(1) {
         for (i, key) in entry.keys.iter().enumerate() {
-            let key_index = inferred_index_for_hir_map_key(key, src)?;
+            let key_index = inferred_index_for_hir_map_key(key, expected_axes.get(i), src)?;
             if key_index != axes[i].index {
                 return Err(GraphcalError::IndexMismatch {
                     expected: axes[i].index.name(),
@@ -4473,6 +4788,10 @@ fn infer_hir_map_literal(
                 });
             }
         }
+    }
+
+    if let Some((collector, owner)) = &local_types.control.materialized_shapes {
+        collector.record_map_literal_axes(owner.as_ref(), expr, &axes);
     }
 
     let incompatible_key_error = |key: IndexEntryKey| GraphcalError::EvalError {
@@ -4500,7 +4819,7 @@ fn infer_hir_map_literal(
             .iter()
             .enumerate()
             .map(|(i, key)| {
-                let entry_key = hir_map_entry_key(key);
+                let entry_key = hir_map_entry_key(key, &axes[i], tir, src)?;
                 if !axes[i].entry_keys.contains(&entry_key) {
                     return match (arity, entry_key) {
                         (1, extra) => Err(GraphcalError::ExtraVariants {
@@ -4583,8 +4902,9 @@ fn infer_hir_map_literal(
         });
     }
 
-    let first_type = infer_hir_type(
+    let first_type = infer_hir_type_with_expected(
         &first_entry.value,
+        expected_element.as_ref(),
         owner_decl_name,
         declared_types,
         local_types,
@@ -4606,8 +4926,9 @@ fn infer_hir_map_literal(
         }
     }
     for entry in entries.iter().skip(1) {
-        let entry_type = infer_hir_type(
+        let entry_type = infer_hir_type_with_expected(
             &entry.value,
+            expected_element.as_ref(),
             owner_decl_name,
             declared_types,
             local_types,

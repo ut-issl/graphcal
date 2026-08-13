@@ -327,6 +327,139 @@ node values: Dimensionless[Tiny] = for t: Tiny { coord(t) };
     );
 }
 
+// ============================================================================
+// #1370: quantity-keyed literals over concrete coordinate axes.
+// ============================================================================
+
+fn quantity_leaves(value: &Value) -> Vec<f64> {
+    match value {
+        Value::Quantity { si_value, .. } => vec![*si_value],
+        Value::Indexed { entries, .. } => entries.values().flat_map(quantity_leaves).collect(),
+        other => panic!("expected a quantity or indexed quantity, got {other:?}"),
+    }
+}
+
+#[test]
+fn coordinate_quantity_keys_populate_map_and_table_literals() {
+    let source = r#"
+        index Altitude = range(300.0 km, 320.0 km, step: 10.0 km);
+        index Stat = { Min, Max };
+
+        node map_1d: (Mass/Length^3)[Altitude] = {
+            300.0 km: 1.0 kg/m^3,
+            310.0 km: 2.0 kg/m^3,
+            320.0 km: 3.0 kg/m^3,
+        };
+        node table_1d: (Mass/Length^3)[Altitude] = table[Altitude] {
+            300.0 km: 4.0 kg/m^3;
+            310.0 km: 5.0 kg/m^3;
+            320.0 km: 6.0 kg/m^3;
+        };
+        node map_2d: (Mass/Length^3)[Altitude, Stat] = {
+            (300.0 km, Stat.Min): 7.0 kg/m^3,
+            (300.0 km, Stat.Max): 8.0 kg/m^3,
+            (310.0 km, Stat.Min): 9.0 kg/m^3,
+            (310.0 km, Stat.Max): 10.0 kg/m^3,
+            (320.0 km, Stat.Min): 11.0 kg/m^3,
+            (320.0 km, Stat.Max): 12.0 kg/m^3,
+        };
+        node table_2d: (Mass/Length^3)[Altitude, Stat] = table[Altitude, Stat] {
+            : Min, Max;
+            300.0 km: 13.0 kg/m^3, 14.0 kg/m^3;
+            310.0 km: 15.0 kg/m^3, 16.0 kg/m^3;
+            320.0 km: 17.0 kg/m^3, 18.0 kg/m^3;
+        };
+        node table_coordinate_columns: (Mass/Length^3)[Stat, Altitude] = table[Stat, Altitude] {
+            : 300.0 km, 310.0 km, 320.0 km;
+            Min: 19.0 kg/m^3, 20.0 kg/m^3, 21.0 kg/m^3;
+            Max: 22.0 kg/m^3, 23.0 kg/m^3, 24.0 kg/m^3;
+        };
+    "#;
+    let result = compile_and_eval(source).unwrap();
+
+    assert_eq!(
+        quantity_leaves(&find_entry(&result, "map_1d")),
+        [1.0, 2.0, 3.0]
+    );
+    assert_eq!(
+        quantity_leaves(&find_entry(&result, "table_1d")),
+        [4.0, 5.0, 6.0]
+    );
+    assert_eq!(
+        quantity_leaves(&find_entry(&result, "map_2d")),
+        [7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+    );
+    assert_eq!(
+        quantity_leaves(&find_entry(&result, "table_2d")),
+        [13.0, 14.0, 15.0, 16.0, 17.0, 18.0]
+    );
+    assert_eq!(
+        quantity_leaves(&find_entry(&result, "table_coordinate_columns")),
+        [19.0, 20.0, 21.0, 22.0, 23.0, 24.0]
+    );
+}
+
+#[test]
+fn nested_coordinate_map_keys_use_the_nested_expected_axis() {
+    let source = r#"
+        index Scenario = { Nominal, Contingency };
+        index Altitude = range(300.0 km, 310.0 km, step: 10.0 km);
+
+        node values: Length[Scenario, Altitude] = {
+            Scenario.Nominal: {
+                300.0 km: 1.0 m,
+                310.0 km: 2.0 m,
+            },
+            Scenario.Contingency: {
+                300.0 km: 3.0 m,
+                310.0 km: 4.0 m,
+            },
+        };
+    "#;
+    let result = compile_and_eval(source).unwrap();
+    assert_eq!(
+        quantity_leaves(&find_entry(&result, "values")),
+        [1.0, 2.0, 3.0, 4.0]
+    );
+}
+
+#[test]
+fn coordinate_quantity_key_rejects_wrong_dimension() {
+    let error = compile_and_eval(
+        r#"
+            index Altitude = range(300.0 km, 310.0 km, step: 10.0 km);
+            node values: (Mass/Length^3)[Altitude] = {
+                300.0 s: 1.0 kg/m^3,
+                310.0 s: 2.0 kg/m^3,
+            };
+        "#,
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("coordinate key dimension"), "{message}");
+    assert!(message.contains("Altitude"), "{message}");
+}
+
+#[test]
+fn coordinate_quantity_key_rejects_off_grid_value_with_nearest_point() {
+    let error = compile_and_eval(
+        r#"
+            index Altitude = range(300.0 km, 310.0 km, step: 10.0 km);
+            node values: (Mass/Length^3)[Altitude] = {
+                301.0 km: 1.0 kg/m^3,
+                310.0 km: 2.0 kg/m^3,
+            };
+        "#,
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("does not lie on coordinate index `Altitude`"),
+        "{message}"
+    );
+    assert!(message.contains("nearest grid point is 300"), "{message}");
+}
+
 #[test]
 fn descending_range_and_linspace_are_monotone_with_exact_endpoints() {
     let source = r#"

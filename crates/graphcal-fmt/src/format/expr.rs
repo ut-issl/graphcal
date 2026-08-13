@@ -1,6 +1,6 @@
 use graphcal_compiler::syntax::ast::{
-    BinOp, Expr, ExprKind, FieldInit, ForBinding, IndexArg, MapEntry, MatchArm, MatchPattern,
-    ModulePath, ParamBinding, PatternBinding, TableIndexSpec, UnaryOp,
+    BinOp, Expr, ExprKind, FieldInit, ForBinding, IndexArg, MapEntry, MapEntryKey, MatchArm,
+    MatchPattern, ModulePath, ParamBinding, PatternBinding, TableIndexSpec, UnaryOp,
 };
 use graphcal_compiler::syntax::local_name::LocalName;
 use graphcal_compiler::syntax::span::Spanned;
@@ -570,17 +570,16 @@ pub fn format_map_literal(fmt: &mut Formatter<'_>, entries: &[MapEntry]) -> RcDo
         let leading = fmt.drain_comments_before(e.value.span.offset());
 
         let key_doc = if e.keys.len() == 1 {
-            RcDoc::text(format!(
-                "{}.{}",
-                e.keys[0].index.value, e.keys[0].variant.value
-            ))
+            format_map_key(fmt, &e.keys[0], true)
         } else {
-            let key_parts: Vec<String> = e
+            let key_parts: Vec<RcDoc<'static>> = e
                 .keys
                 .iter()
-                .map(|k| format!("{}.{}", k.index.value, k.variant.value))
+                .map(|key| format_map_key(fmt, key, true))
                 .collect();
-            RcDoc::text(format!("({})", key_parts.join(", ")))
+            RcDoc::text("(")
+                .append(RcDoc::intersperse(key_parts, RcDoc::text(", ")))
+                .append(RcDoc::text(")"))
         };
         let entry_doc = key_doc
             .append(RcDoc::text(": "))
@@ -602,6 +601,39 @@ pub fn format_map_literal(fmt: &mut Formatter<'_>, entries: &[MapEntry]) -> RcDo
         )
         .append(RcDoc::hardline())
         .append(RcDoc::text("}"))
+}
+
+fn format_map_key(
+    fmt: &mut Formatter<'_>,
+    key: &MapEntryKey,
+    qualify_discrete: bool,
+) -> RcDoc<'static> {
+    match key {
+        MapEntryKey::Discrete { index, entry, .. } if qualify_discrete => {
+            RcDoc::text(format!("{}.{}", index.value, entry.value))
+        }
+        MapEntryKey::Discrete { entry, .. } => RcDoc::text(entry.value.to_string()),
+        MapEntryKey::Expression { expr, .. } => format_delimited_expr(fmt, expr),
+    }
+}
+
+fn render_map_key(fmt: &Formatter<'_>, key: &MapEntryKey, qualify_discrete: bool) -> String {
+    let mut key_fmt = fmt.fork_skipping_comments_before(map_key_start(key));
+    render_doc_to_string(&format_map_key(&mut key_fmt, key, qualify_discrete))
+}
+
+const fn map_key_start(key: &MapEntryKey) -> usize {
+    match key {
+        MapEntryKey::Discrete { index, .. } => index.span.offset(),
+        MapEntryKey::Expression { expr, .. } => expr.span.offset(),
+    }
+}
+
+const fn map_key_end(key: &MapEntryKey) -> usize {
+    match key {
+        MapEntryKey::Discrete { entry, .. } => entry.span.offset() + entry.span.len(),
+        MapEntryKey::Expression { expr, .. } => expr.span.offset() + expr.span.len(),
+    }
 }
 
 /// Format a table literal expression: `table[Index1, Index2] { ... }`
@@ -649,7 +681,7 @@ fn format_table_1d(
     } else {
         entries
             .iter()
-            .map(|e| display_width(&e.keys[0].variant.value.to_string()))
+            .map(|e| display_width(&render_map_key(fmt, &e.keys[0], false)))
             .max()
             .unwrap_or(0)
     };
@@ -677,7 +709,7 @@ fn format_table_1d(
         let row_text = if finite_index {
             format!("{}{};", " ".repeat(value_padding), rendered)
         } else {
-            let label = e.keys[0].variant.value.to_string();
+            let label = render_map_key(fmt, &e.keys[0], false);
             let padding = max_label_width - display_width(&label);
             format!(
                 "{}:{} {};",
@@ -744,7 +776,7 @@ fn format_table_2d_body(
     // Extract unique column labels (from the last key, preserving order)
     let mut col_labels: Vec<String> = Vec::new();
     for e in entries {
-        let col_label = e.keys[col_idx].variant.value.to_string();
+        let col_label = render_map_key(fmt, &e.keys[col_idx], false);
         if !col_labels.contains(&col_label) {
             col_labels.push(col_label);
         }
@@ -754,7 +786,7 @@ fn format_table_2d_body(
     // Extract unique row labels (from the second-to-last key, preserving order)
     let mut row_labels: Vec<String> = Vec::new();
     for e in entries {
-        let row_label = e.keys[row_idx].variant.value.to_string();
+        let row_label = render_map_key(fmt, &e.keys[row_idx], false);
         if !row_labels.contains(&row_label) {
             row_labels.push(row_label);
         }
@@ -764,8 +796,8 @@ fn format_table_2d_body(
     let mut grid: Vec<Vec<String>> = vec![vec![String::new(); num_cols]; row_labels.len()];
     let mut entry_indices: Vec<Vec<Option<usize>>> = vec![vec![None; num_cols]; row_labels.len()];
     for (ei, e) in entries.iter().enumerate() {
-        let row_label = e.keys[row_idx].variant.value.to_string();
-        let col_label = e.keys[col_idx].variant.value.to_string();
+        let row_label = render_map_key(fmt, &e.keys[row_idx], false);
+        let col_label = render_map_key(fmt, &e.keys[col_idx], false);
         // Labels were built from the same entries, so lookup cannot miss.
         // If it somehow does, skip this entry rather than silently using row/col 0.
         let Some(ri) = row_labels.iter().position(|r| r == &row_label) else {
@@ -884,11 +916,12 @@ fn format_table_sliced(
     let mut slices: Vec<(Vec<usize>, Vec<String>)> = Vec::new();
     for (idx, e) in entries.iter().enumerate() {
         let slice_key: Vec<String> = (0..slice_dims)
-            .map(|i| match &indexes[i] {
-                TableIndexSpec::Named(_) => {
-                    format!("{}.{}", e.keys[i].index.value, e.keys[i].variant.value)
-                }
-                TableIndexSpec::Finite { .. } => e.keys[i].variant.value.to_string(),
+            .map(|i| {
+                render_map_key(
+                    fmt,
+                    &e.keys[i],
+                    matches!(&indexes[i], TableIndexSpec::Named(_)),
+                )
             })
             .collect();
 
@@ -906,12 +939,12 @@ fn format_table_sliced(
 
         // Drain leading comments before this slice header
         let first_idx = entry_indices[0];
-        let first_key_offset = entries[first_idx].keys[0].index.span.offset();
+        let first_key_offset = map_key_start(&entries[first_idx].keys[0]);
         let leading = fmt.drain_comments_before(first_key_offset);
 
         // Drain trailing comment on the same line as the slice header "]"
         let last_slice_key = &entries[first_idx].keys[slice_dims - 1];
-        let header_end = last_slice_key.variant.span.offset() + last_slice_key.variant.span.len();
+        let header_end = map_key_end(last_slice_key);
         let trailing = fmt
             .drain_trailing_comment(header_end)
             .unwrap_or_else(RcDoc::nil);

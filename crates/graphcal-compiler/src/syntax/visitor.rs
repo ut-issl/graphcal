@@ -245,6 +245,11 @@ pub(crate) trait ExprVisitor<P: Phase> {
         entries: &[crate::syntax::ast::MapEntry<P>],
     ) -> Result<(), Self::Error> {
         for entry in entries {
+            for key in &entry.keys {
+                if let crate::syntax::ast::MapEntryKey::Expression { expr, .. } = key {
+                    self.visit_expr(expr)?;
+                }
+            }
             self.visit_expr(&entry.value)?;
         }
         Ok(())
@@ -483,6 +488,11 @@ pub trait ExprVisitorMut<P: Phase> {
     fn visit_map_literal_mut(&mut self, expr: &mut Expr<P>) -> Result<(), Self::Error> {
         if let ExprKind::MapLiteral { entries } = &mut expr.kind {
             for entry in entries {
+                for key in &mut entry.keys {
+                    if let crate::syntax::ast::MapEntryKey::Expression { expr, .. } = key {
+                        self.visit_expr_mut(expr)?;
+                    }
+                }
                 self.visit_expr_mut(&mut entry.value)?;
             }
         }

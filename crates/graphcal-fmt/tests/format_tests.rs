@@ -832,6 +832,30 @@ param dv: Dimensionless[Maneuver] = table[Maneuver] {
 }
 
 #[test]
+fn coordinate_quantity_keys_round_trip_in_maps_and_tables() {
+    let source = r"
+index Altitude = range(300.0 km, 310.0 km, step: 10.0 km);
+node mapped: Length[Altitude] = {
+    300.0 km: 1.0 m,
+    310.0 km: 2.0 m,
+};
+node tabulated: Length[Altitude] = table[Altitude] {
+    300.0 km: 1.0 m;
+    310.0 km: 2.0 m;
+};
+index Stat = { Min, Max };
+node matrix: Length[Stat, Altitude] = table[Stat, Altitude] {
+    : 300.0 km, 310.0 km;
+    Min: 1.0 m, 2.0 m;
+    Max: 3.0 m, 4.0 m;
+};
+";
+    let formatted = format_source(source).unwrap();
+    assert!(formatted.contains("300.0 km: 1.0 m"), "{formatted}");
+    assert_eq!(format_source(&formatted).unwrap(), formatted);
+}
+
+#[test]
 fn format_table_1d_aligns_values() {
     let source = r"
 index Maneuver = { Departure, Correction, Insertion };

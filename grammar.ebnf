@@ -984,11 +984,13 @@ field_init
    = IDENT, ":", expr;
 
 (* --- Map literal --- *)
-(* Single-axis map literals use qualified variant keys:
+(* Single-axis map literals use qualified variant keys or coordinate quantities:
      { Index.Variant1: expr1, module.Index.Variant2: expr2, ... }
+     { 300.0 km: expr1, 310.0 km: expr2, ... }
    Multi-axis map literals use tuple keys:
-     { (I1.V1, I2.V2): expr1, (I1.V1, I2.V3): expr2, ... }
-   All labels of the index (or all label tuples) must be present
+     { (300.0 km, I2.V2): expr1, (310.0 km, I2.V3): expr2, ... }
+   Coordinate keys are semantically restricted to statically evaluable
+   quantities on the concrete axis grid. All keys (or all key tuples) must be present
    (totality requirement). *)
 map_literal
    = "{", map_entry, { ",", map_entry }, [ "," ], "}";
@@ -998,11 +1000,15 @@ map_entry
    | tuple_key_entry;
 
 single_key_entry
-   = ident_path, ":", expr;              (* path must contain at least two segments *)
+   = map_key, ":", expr;
 
 tuple_key_entry
-   = "(", ident_path,
-     { ",", ident_path }, ")", ":", expr;  (* each key path must contain at least two segments *)
+   = "(", map_key,
+     { ",", map_key }, ")", ":", expr;
+
+map_key
+   = qualified_variant
+   | expr;                                (* must be a static coordinate quantity *)
 
 (* --- Table expression (syntax sugar, desugars to map_literal) ---     *)
 (*                                                                      *)
@@ -1032,6 +1038,7 @@ table_slice_section
 
 table_slice_label
    = qualified_variant          (* for named axes *)
+   | expr                       (* for coordinate axes; static quantity *)
    | "#", NAT_LITERAL;          (* for Fin axes *)
 
 (* When the column axis is Fin, `table_header_row` is omitted.          *)
@@ -1039,15 +1046,19 @@ table_single
    = [ table_header_row ], table_data_row, { table_data_row };
 
 table_header_row
-   = ":", IDENT, { ",", IDENT }, ";";
+   = ":", table_axis_label, { ",", table_axis_label }, ";";
+
+table_axis_label
+   = IDENT                      (* for named axes *)
+   | expr;                      (* for coordinate axes; static quantity *)
 
 (* When the row axis is Fin, `IDENT, ":"` is omitted.                  *)
 table_data_row
-   = [ IDENT, ":" ], expr, { ",", expr }, ";";
+   = [ table_axis_label, ":" ], expr, { ",", expr }, ";";
 
 (* When the index is Fin, `IDENT, ":"` is omitted.                     *)
 table_data_row_1d
-   = [ IDENT, ":" ], expr, ";";
+   = [ table_axis_label, ":" ], expr, ";";
 
 qualified_variant
    = IDENT, ".", IDENT, { ".", IDENT };

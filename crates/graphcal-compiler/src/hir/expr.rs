@@ -796,6 +796,11 @@ fn collect_expr_dependencies_into_inner(expr: &Expr, deps: &mut ExprDependencies
         }
         ExprKind::MapLiteral { entries } => {
             for entry in entries {
+                for key in &entry.keys {
+                    if let MapEntryKey::Expression { expr, .. } = key {
+                        collect_expr_dependencies_into(expr, deps);
+                    }
+                }
                 collect_expr_dependencies_into(&entry.value, deps);
             }
         }
@@ -893,9 +898,14 @@ fn visit_expr_inner(expr: &Expr, visitor: &mut impl FnMut(&Expr)) {
         ExprKind::ConstructorCall { fields, .. } => fields
             .iter()
             .for_each(|field| visit_expr(&field.value, visitor)),
-        ExprKind::MapLiteral { entries } => entries
-            .iter()
-            .for_each(|entry| visit_expr(&entry.value, visitor)),
+        ExprKind::MapLiteral { entries } => entries.iter().for_each(|entry| {
+            entry.keys.iter().for_each(|key| {
+                if let MapEntryKey::Expression { expr, .. } = key {
+                    visit_expr(expr, visitor);
+                }
+            });
+            visit_expr(&entry.value, visitor);
+        }),
         ExprKind::ForComp { body, .. } => visit_expr(body, visitor),
         ExprKind::IndexAccess { expr: inner, args } => {
             visit_expr(inner, visitor);
@@ -1100,9 +1110,16 @@ fn find_extern_call_inner(expr: &Expr) -> Option<(&ExternFnRef, Span)> {
         ExprKind::ConstructorCall { fields, .. } => fields
             .iter()
             .find_map(|field| find_extern_call(&field.value)),
-        ExprKind::MapLiteral { entries } => entries
-            .iter()
-            .find_map(|entry| find_extern_call(&entry.value)),
+        ExprKind::MapLiteral { entries } => entries.iter().find_map(|entry| {
+            entry
+                .keys
+                .iter()
+                .find_map(|key| match key {
+                    MapEntryKey::Expression { expr, .. } => find_extern_call(expr),
+                    MapEntryKey::IndexVariant(_) | MapEntryKey::FinitePosition { .. } => None,
+                })
+                .or_else(|| find_extern_call(&entry.value))
+        }),
         ExprKind::ForComp { body, .. } => find_extern_call(body),
         ExprKind::IndexAccess { expr: inner, args } => find_extern_call(inner).or_else(|| {
             args.iter().find_map(|arg| match arg {
@@ -1160,10 +1177,18 @@ pub struct MapEntry {
 }
 
 /// A single resolved map key.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum MapEntryKey {
     IndexVariant(IndexVariantRef),
     FinitePosition { size: u64, position: Spanned<u64> },
+    Expression { axis: MapKeyAxis, expr: Box<Expr> },
+}
+
+/// Where an expression-shaped map key obtains its semantic axis.
+#[derive(Debug, Clone)]
+pub enum MapKeyAxis {
+    Explicit(Spanned<ResolvedIndexName>),
+    Contextual,
 }
 
 /// A resolved for-comprehension binding.
@@ -1315,9 +1340,19 @@ impl<'a> ExprLowerer<'a> {
             ast::ExprKind::ConstructorCall { fields, .. } => {
                 fields.iter().map(|field| &field.value).collect()
             }
-            ast::ExprKind::MapLiteral { entries } => {
-                entries.iter().map(|entry| &entry.value).collect()
-            }
+            ast::ExprKind::MapLiteral { entries } => entries
+                .iter()
+                .flat_map(|entry| {
+                    entry
+                        .keys
+                        .iter()
+                        .filter_map(|key| match key {
+                            ast::MapEntryKey::Expression { expr, .. } => Some(expr),
+                            ast::MapEntryKey::Discrete { .. } => None,
+                        })
+                        .chain(std::iter::once(&entry.value))
+                })
+                .collect(),
             ast::ExprKind::ForComp { body, .. } => vec![body],
             ast::ExprKind::IndexAccess { expr, args } => std::iter::once(expr.as_ref())
                 .chain(args.iter().filter_map(|arg| match arg {
@@ -2348,22 +2383,45 @@ impl<'a> ExprLowerer<'a> {
     }
 
     fn lower_map_entry_key(
-        &self,
+        &mut self,
         key: &ast::MapEntryKey,
         map_span: Span,
     ) -> Result<MapEntryKey, ExprLowerError> {
-        match (&key.index.value, &key.variant.value) {
+        if let ast::MapEntryKey::Expression { axis, expr } = key {
+            let axis = match axis {
+                ast::MapKeyAxisSyntax::Explicit(index) => {
+                    let resolved = self
+                        .ctx
+                        .resolver
+                        .resolve_index_path(self.ctx.owner, &index.value)
+                        .map_err(|source| ExprLowerError::ModuleResolve {
+                            source,
+                            span: index.span,
+                        })?;
+                    MapKeyAxis::Explicit(Spanned::new(resolved, index.span))
+                }
+                ast::MapKeyAxisSyntax::Contextual => MapKeyAxis::Contextual,
+            };
+            return Ok(MapEntryKey::Expression {
+                axis,
+                expr: Box::new(self.lower_expr(expr)),
+            });
+        }
+        let ast::MapEntryKey::Discrete {
+            index,
+            additional_index_spans,
+            entry,
+        } = key
+        else {
+            return Err(ExprLowerError::InvalidMapEntryKey { span: map_span });
+        };
+        match (&index.value, &entry.value) {
             (
                 crate::syntax::ast::MapEntryIndex::Named(index_path),
                 IndexEntryKey::Named(variant_name),
             ) => {
                 let variant = self
-                    .resolve_index_variant_parts(
-                        index_path,
-                        variant_name,
-                        key.index.span,
-                        key.variant.span,
-                    )
+                    .resolve_index_variant_parts(index_path, variant_name, index.span, entry.span)
                     .map_err(|err| match err {
                         ExprLowerError::ModuleResolve {
                             source: ModuleResolveError::UnknownIndexVariant { index, variant },
@@ -2377,9 +2435,9 @@ impl<'a> ExprLowerer<'a> {
                     })?;
                 Ok(MapEntryKey::IndexVariant(IndexVariantRef {
                     variant,
-                    index_span: Some(key.index.span),
-                    additional_index_spans: key.additional_index_spans.clone(),
-                    variant_span: key.variant.span,
+                    index_span: Some(index.span),
+                    additional_index_spans: additional_index_spans.clone(),
+                    variant_span: entry.span,
                 }))
             }
             (
@@ -2387,13 +2445,11 @@ impl<'a> ExprLowerer<'a> {
                 IndexEntryKey::Position(position),
             ) => Ok(MapEntryKey::FinitePosition {
                 size: *size,
-                position: Spanned::new(*position, key.variant.span),
+                position: Spanned::new(*position, entry.span),
             }),
             (crate::syntax::ast::MapEntryIndex::Named(_), IndexEntryKey::Position(_))
             | (crate::syntax::ast::MapEntryIndex::Finite(_), IndexEntryKey::Named(_)) => {
-                Err(ExprLowerError::InvalidMapEntryKey {
-                    span: key.variant.span,
-                })
+                Err(ExprLowerError::InvalidMapEntryKey { span: entry.span })
             }
         }
     }

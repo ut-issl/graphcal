@@ -434,8 +434,21 @@ impl<'a> HirRefCollector<'a> {
             hir::ExprKind::MapLiteral { entries } => {
                 for entry in entries {
                     for key in &entry.keys {
-                        if let hir::expr::MapEntryKey::IndexVariant(variant) = key {
-                            Self::variant_reference(variant, table);
+                        match key {
+                            hir::expr::MapEntryKey::IndexVariant(variant) => {
+                                Self::variant_reference(variant, table);
+                            }
+                            hir::expr::MapEntryKey::Expression { axis, expr } => {
+                                if let hir::expr::MapKeyAxis::Explicit(index) = axis {
+                                    Self::reference(
+                                        table,
+                                        index.span,
+                                        SymbolKey::Index(index.value.clone()),
+                                    );
+                                }
+                                self.walk(expr, table);
+                            }
+                            hir::expr::MapEntryKey::FinitePosition { .. } => {}
                         }
                     }
                     self.walk(&entry.value, table);

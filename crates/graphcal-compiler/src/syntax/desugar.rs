@@ -140,10 +140,10 @@ pub(crate) fn expand_multi_decl(multi: &MultiDecl) -> Vec<ExpandedSlotDecl> {
             match col_span {
                 MultiSlotColumnSpan::Single(col_idx) => {
                     for row in slice.rows() {
-                        let row_key = MapEntryKey {
+                        let row_key = MapEntryKey::Discrete {
                             index: row_index_name.clone(),
                             additional_index_spans: Vec::new(),
-                            variant: row.label().clone(),
+                            entry: row.label().clone(),
                         };
                         slot_entries.push(MapEntry {
                             keys: multi_entry_keys(slice.prefix_keys().to_vec(), row_key, None),
@@ -174,18 +174,18 @@ pub(crate) fn expand_multi_decl(multi: &MultiDecl) -> Vec<ExpandedSlotDecl> {
                             col_variants.iter().enumerate()
                         {
                             let global_col = start + local_col;
-                            let row_key = MapEntryKey {
+                            let row_key = MapEntryKey::Discrete {
                                 index: row_index_name.clone(),
                                 additional_index_spans: Vec::new(),
-                                variant: row.label().clone(),
+                                entry: row.label().clone(),
                             };
-                            let extra_key = MapEntryKey {
+                            let extra_key = MapEntryKey::Discrete {
                                 index: Spanned::new(
                                     MapEntryIndex::Named(column_axis.value.clone()),
                                     column_axis.span,
                                 ),
                                 additional_index_spans: vec![extra_axis.span],
-                                variant: Spanned::new(
+                                entry: Spanned::new(
                                     IndexEntryKey::named(col_variant.value.clone()),
                                     col_variant.span,
                                 ),

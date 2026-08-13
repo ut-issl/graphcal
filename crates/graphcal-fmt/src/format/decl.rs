@@ -908,7 +908,7 @@ pub fn format_multi_decl(fmt: &mut Formatter<'_>, info: &MultiDecl) -> RcDoc<'st
             let labels = slice
                 .prefix_keys()
                 .iter()
-                .map(format_multi_decl_key)
+                .map(|key| format_multi_decl_key(fmt, key))
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push('\n');
@@ -963,15 +963,21 @@ pub fn format_multi_decl(fmt: &mut Formatter<'_>, info: &MultiDecl) -> RcDoc<'st
     text_with_hardlines(&out)
 }
 
-fn format_multi_decl_key(key: &MapEntryKey) -> String {
-    match (&key.index.value, &key.variant.value) {
-        (MapEntryIndex::Named(index), IndexEntryKey::Named(variant)) => {
-            format!("{index}.{variant}")
+fn format_multi_decl_key(fmt: &Formatter<'_>, key: &MapEntryKey) -> String {
+    match key {
+        MapEntryKey::Discrete { index, entry, .. } => match (&index.value, &entry.value) {
+            (MapEntryIndex::Named(index), IndexEntryKey::Named(variant)) => {
+                format!("{index}.{variant}")
+            }
+            (MapEntryIndex::Finite(_), IndexEntryKey::Position(position)) => {
+                format!("#{position}")
+            }
+            (index, variant) => format!("{index}.{variant}"),
+        },
+        MapEntryKey::Expression { expr, .. } => {
+            let mut key_fmt = fmt.fork_skipping_comments_before(expr.span.offset());
+            render_doc_to_string(&format_expr(&mut key_fmt, expr))
         }
-        (MapEntryIndex::Finite(_), IndexEntryKey::Position(position)) => {
-            format!("#{position}")
-        }
-        (index, variant) => format!("{index}.{variant}"),
     }
 }
 

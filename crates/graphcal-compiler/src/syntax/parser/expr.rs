@@ -838,6 +838,11 @@ impl Parser<'_> {
                     ident_span,
                 ))
             }
+        } else if self.lexer.peek() == Some(&Token::Number)
+            || self.lexer.peek() == Some(&Token::Minus)
+        {
+            let quantity = self.parse_expr()?;
+            self.parse_coordinate_map_literal_after_first_entry(start_span, quantity)
         } else if self.lexer.peek() == Some(&Token::LParen) {
             // Could be tuple-key map literal: { (Index.Variant, ...): expr, ... }
             self.parse_tuple_key_map_literal(start_span)

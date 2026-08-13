@@ -442,12 +442,24 @@ impl PresentationResolver<'_> {
         src: &NamedSource<Arc<String>>,
         span: Span,
     ) -> Result<PresentationProvenance, GraphcalError> {
+        let axes = self
+            .dag(dag_id, DiagnosticAnchor::Source(span))?
+            .map_literal_axes(owner, span)
+            .map(|axes| axes.as_slice().to_vec());
         let mut result = None;
         for entry in entries {
             let path = entry
                 .keys
                 .iter()
-                .map(map_key_part)
+                .enumerate()
+                .map(|(position, key)| {
+                    map_key_part(
+                        key,
+                        axes.as_ref().and_then(|axes| axes.get(position)),
+                        self.tir,
+                        src,
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             let leaf = self.expression(owner, dag_id, &entry.value, src)?;
             let nested = singleton_indexed_path(&path, leaf);
@@ -561,6 +573,9 @@ fn presentation_index(
 
 fn map_key_part(
     key: &hir::expr::MapEntryKey,
+    checked_axis: Option<&IndexTypeRef>,
+    tir: &crate::tir::typed::TIR,
+    src: &NamedSource<Arc<String>>,
 ) -> Result<(IndexTypeRef, IndexEntryKey), GraphcalError> {
     match key {
         hir::expr::MapEntryKey::IndexVariant(variant) => Ok((
@@ -580,6 +595,55 @@ fn map_key_part(
                 IndexTypeRef::from_finite_index(finite),
                 IndexEntryKey::position(position.value),
             ))
+        }
+        hir::expr::MapEntryKey::Expression { expr, .. } => {
+            let surface_axis = match key {
+                hir::expr::MapEntryKey::Expression {
+                    axis: hir::expr::MapKeyAxis::Explicit(index),
+                    ..
+                } => Some(IndexTypeRef::from_resolved(index.value.clone())),
+                _ => None,
+            };
+            let axis = checked_axis.or(surface_axis.as_ref()).ok_or_else(|| {
+                GraphcalError::internal_error(
+                    "contextual map key has no checked axis facts",
+                    src,
+                    DiagnosticAnchor::Source(expr.span),
+                )
+            })?;
+            let Some(index) = axis.declared_resolved() else {
+                return Err(GraphcalError::InternalError {
+                    message: "checked expression-shaped map key has a finite axis".to_string(),
+                    src: src.clone(),
+                    span: expr.span.into(),
+                });
+            };
+            let definition =
+                tir.declared_index_def(index)
+                    .ok_or_else(|| GraphcalError::UnknownIndex {
+                        name: index.to_unowned_def_name(),
+                        src: src.clone(),
+                        span: expr.span.into(),
+                    })?;
+            let data =
+                definition
+                    .coordinate_data()
+                    .ok_or_else(|| GraphcalError::InternalError {
+                        message: format!(
+                            "checked coordinate map key uses non-coordinate index `{index}`"
+                        ),
+                        src: src.clone(),
+                        span: expr.span.into(),
+                    })?;
+            let (value, _) = infer::hir::static_coordinate_quantity(expr, tir, src)?;
+            let position = data
+                .position_of(value)
+                .ok_or_else(|| GraphcalError::InternalError {
+                    message: format!("checked coordinate map key {value} is not on `{index}`"),
+                    src: src.clone(),
+                    span: expr.span.into(),
+                })?;
+            Ok((axis.clone(), IndexEntryKey::position(position as u64)))
         }
     }
 }

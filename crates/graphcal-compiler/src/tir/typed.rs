@@ -599,6 +599,7 @@ fn type_resolve_dag(
         type_defs,
         decl_bindings: HashMap::new(),
         materialized_shapes: HashMap::new(),
+        map_literal_axes: HashMap::new(),
         presentation: crate::tir::presentation::DagPresentationFacts::default(),
     };
 
@@ -1581,8 +1582,14 @@ impl HirPolicyChecker<'_> {
             hir::ExprKind::MapLiteral { entries } => {
                 for entry in entries {
                     for key in &entry.keys {
-                        if let hir::expr::MapEntryKey::IndexVariant(variant) = key {
-                            self.check_variant_literal(variant, check_pub_bind_literals)?;
+                        match key {
+                            hir::expr::MapEntryKey::IndexVariant(variant) => {
+                                self.check_variant_literal(variant, check_pub_bind_literals)?;
+                            }
+                            hir::expr::MapEntryKey::Expression { expr, .. } => {
+                                recurse(expr)?;
+                            }
+                            hir::expr::MapEntryKey::FinitePosition { .. } => {}
                         }
                     }
                     recurse(&entry.value)?;
